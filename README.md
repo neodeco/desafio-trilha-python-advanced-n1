@@ -13,8 +13,23 @@ This workspace now contains a small AWS Glue-style ingestion workflow that can b
 ## Run the transformation locally
 
 ```bash
-source .venv/Scripts/activate
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+# Windows CMD
+.venv\Scripts\activate.bat
+# then run the pipeline
 python -m app.glue_job --input files/raw_stock_data.csv --output output/processed_stock_data.parquet
+```
+
+## Run the predictive model locally
+
+```bash
+# Activate the repository virtual environment first
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+# Windows CMD
+.venv\Scripts\activate.bat
+python scripts/spark_predictive_model.py --training-dir files/training-set --test-file files/test-set/COTAHIST_A2020.TXT --output-dir output/model
 ```
 
 ## Run the LocalStack bootstrap
