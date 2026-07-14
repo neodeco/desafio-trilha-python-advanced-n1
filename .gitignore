@@ -21,6 +21,7 @@ rad.json
 *.flf
 *.txt
 *.log
+*.csv
 #Test results file
 TestResults.xml
 #Idea files
