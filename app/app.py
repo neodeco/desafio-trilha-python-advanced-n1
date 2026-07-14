@@ -1,14 +1,17 @@
 import os
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import streamlit as st
+from pandas import DataFrame
+from pandas.io.parsers import TextFileReader
 
 st.set_page_config(page_title="Stock Data Dashboard", page_icon="📈", layout="wide")
 
 
 @st.cache_data(show_spinner=False)
-def load_data(path_str: str) -> pd.DataFrame:
+def load_data(path_str: str) -> DataFrame | TextFileReader:
     app_dir = Path(__file__).resolve().parent
     project_root = app_dir.parent
     input_path = Path(path_str)
@@ -21,10 +24,10 @@ def load_data(path_str: str) -> pd.DataFrame:
                 base / "output/processed_stock_data",
                 base / "output/processed_stock_data.parquet",
                 base / "output/processed_cotahist.parquet",
+                base / "files/training-set/traning-set.csv",
             ]
         )
 
-    # remove duplicates while preserving order
     seen = set()
     unique_candidates = []
     for c in candidates:
@@ -33,7 +36,7 @@ def load_data(path_str: str) -> pd.DataFrame:
             seen.add(c_resolved)
             unique_candidates.append(c_resolved)
 
-    existing_path = next((p for p in unique_candidates if p.exists()), None)
+    existing_path: Any | None = next((p for p in unique_candidates if p.exists()), None)
     if existing_path is None:
         searched = ", ".join(str(p) for p in unique_candidates)
         raise FileNotFoundError(f"Data file/path not found. Tried: {searched}")
@@ -42,10 +45,9 @@ def load_data(path_str: str) -> pd.DataFrame:
         return pd.read_parquet(existing_path)
 
     if existing_path.suffix.lower() == ".csv":
-        return pd.read_csv(existing_path)
+        return pd.read_csv(existing_path, sep=None, engine="python")
 
     raise ValueError("Unsupported file format. Use .csv or parquet path.")
-
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     renamed = df.copy()

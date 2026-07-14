@@ -42,8 +42,19 @@ def load_dataset(spark: SparkSession, folder: Path, converter_module: object) ->
 
 def preprocess(df):
     df = (
-        df.withColumn("trade_date", F.when(F.length(F.col("trade_date")) == 6, F.concat(F.col("trade_date"), F.lit("01"))).otherwise(F.col("trade_date")))
-        .withColumn("trade_date_fmt", F.to_date(F.col("trade_date"), "yyyyMMdd"))
+        df.withColumn(
+            "trade_date_norm",
+            F.when(
+                F.col("trade_date").rlike(r"^\d{4}-\d{2}-\d{2}$"),
+                F.regexp_replace(F.col("trade_date"), "-", ""),
+            )
+            .when(
+                F.length(F.col("trade_date")) == 6,
+                F.concat(F.col("trade_date"), F.lit("01")),
+            )
+            .otherwise(F.col("trade_date"))
+        )
+        .withColumn("trade_date_fmt", F.to_date(F.col("trade_date_norm"), "dd-MM-yyyy"))
         .withColumn("open", F.col("open").cast("double"))
         .withColumn("high", F.col("high").cast("double"))
         .withColumn("low", F.col("low").cast("double"))
@@ -55,7 +66,6 @@ def preprocess(df):
     )
 
     return df.filter(F.col("next_close").isNotNull()).orderBy("symbol", "trade_date_fmt")
-
 
 def build_features(df, symbol_filter=None):
     if symbol_filter:
