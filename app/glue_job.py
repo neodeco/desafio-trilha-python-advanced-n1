@@ -10,17 +10,42 @@ from app.glue_pipeline import build_spark_session, transform_stock_data
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a Glue-style stock data ETL job")
-    parser.add_argument("--input", default=os.getenv("RAW_DATA_PATH", "files/training-set/traning-set.csv"), help="Path to the raw CSV data")
-    parser.add_argument("--output", default=os.getenv("PROCESSED_DATA_PATH", "output/processed_stock_data"), help="Destination for the processed Parquet data")
-    parser.add_argument("--bucket", default=os.getenv("S3_BUCKET", "processed-data"), help="Destination S3 bucket for the Parquet file")
-    parser.add_argument("--key", default=os.getenv("S3_KEY", "processed/processed_stock_data.parquet"), help="Destination S3 key for the Parquet file")
-    parser.add_argument("--endpoint-url", default=os.getenv("AWS_ENDPOINT_URL", "http://localhost:4566"), help="LocalStack S3 endpoint URL")
+    parser.add_argument(
+        "--input",
+        default=os.getenv("RAW_DATA_PATH", "files/training-set/traning-set.csv"),
+        help="Path to the raw CSV data",
+    )
+    parser.add_argument(
+        "--sep",
+        default=os.getenv("CSV_SEPARATOR", ";"),
+        help="CSV separator for input data",
+    )
+    parser.add_argument(
+        "--output",
+        default=os.getenv("PROCESSED_DATA_PATH", "output/processed_stock_data"),
+        help="Destination for the processed Parquet data",
+    )
+    parser.add_argument(
+        "--bucket",
+        default=os.getenv("S3_BUCKET", "processed-data"),
+        help="Destination S3 bucket for the Parquet file",
+    )
+    parser.add_argument(
+        "--key",
+        default=os.getenv("S3_KEY", "processed/processed_stock_data.parquet"),
+        help="Destination S3 key for the Parquet file",
+    )
+    parser.add_argument(
+        "--endpoint-url",
+        default=os.getenv("AWS_ENDPOINT_URL", "http://localhost:4566"),
+        help="LocalStack S3 endpoint URL",
+    )
     parser.add_argument("--app-name", default="glue-local-job", help="Spark application name")
     args = parser.parse_args()
 
     spark = build_spark_session(args.app_name)
     try:
-        raw_df = spark.read.option("header", True).option("sep", ";").csv(args.input)
+        raw_df = spark.read.option("header", True).option("sep", args.sep).csv(args.input)
         transformed_df = transform_stock_data(raw_df)
 
         output_dir = os.path.dirname(args.output)
