@@ -45,6 +45,9 @@ jobs:
 
   create-pr:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     needs:
       - validate-branch-flow
       - build
@@ -81,3 +84,4 @@ jobs:
               --body "Automatically created pull request from \`dev\` to \`main\`."
           else
             echo "An open pull request from dev to main already exists."
+          fi
