@@ -19,6 +19,7 @@ rad.json
 #License-files
 *.bclicense
 *.flf
+*.txt
 #Test results file
 TestResults.xml
 #Idea files
