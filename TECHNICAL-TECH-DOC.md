@@ -207,3 +207,27 @@ PY
 2. Run ETL: `python -m app.glue_job --input files/raw_stock_data.csv --output output/processed_stock_data.parquet`
 3. Run model training: `python scripts/spark_predictive_model.py --training-dir files/training-set --test-file files/test-set/COTAHIST_A2020.TXT --output-dir output/model`
 4. Inspect results in `output/model/training_results.csv` and `output/model/test_results.txt`.
+
+## Automation & Monitoring Commands
+
+The automation scripts can be used against AWS or LocalStack (provide `--endpoint-url` to point to LocalStack).
+
+```bash
+# Create a Glue job (example)
+python scripts/glue_automation.py --create-job --job-name glue-etl-job --script-location s3://my-bucket/scripts/glue_job.py
+
+# Create a scheduled trigger
+python scripts/glue_automation.py --create-trigger --trigger-name daily-trigger --job-name glue-etl-job --cron 'cron(0 2 * * ? *)'
+
+# Start a job run immediately
+python scripts/glue_automation.py --start-job --job-name glue-etl-job
+
+# Monitor job runs
+python scripts/monitor_glue_jobs.py --job-name glue-etl-job --interval 30
+```
+
+## Comparative Plot Command
+
+```bash
+python scripts/comparative_series.py --symbol PETR4T --input-dir files/training-set --output-dir output/plots
+```
