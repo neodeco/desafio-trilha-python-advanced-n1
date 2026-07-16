@@ -37,7 +37,7 @@ def _normalize(record: dict, line: str) -> dict:
     if symbol.startswith("20"):
         symbol = symbol[2:]
     if len(symbol) > 8 and symbol[:4].isdigit():
-        symbol = symbol[4:]
+        symbol = symbol[2:]
 
     trade_date = record.get("date", "")
     if len(trade_date) == 8:

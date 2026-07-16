@@ -22,6 +22,7 @@ rad.json
 *.txt
 *.log
 *.csv
+*.png
 #Test results file
 TestResults.xml
 #Idea files
