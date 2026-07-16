@@ -21,7 +21,7 @@ def test_convert_to_csv_creates_pipeline_ready_rows(tmp_path: Path) -> None:
 
     assert len(rows) == 1
     assert rows[0]["symbol"] == "96EALT3F"
-    assert rows[0]["trade_date"] == "20250717"
+    assert rows[0]["trade_date"] == "2025-07-17"
     assert rows[0]["open"] == "15.01"
     assert rows[0]["high"] == "15.37"
     assert rows[0]["low"] == "14.93"

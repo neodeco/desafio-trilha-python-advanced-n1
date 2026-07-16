@@ -1,0 +1,10 @@
+boto3
+matplotlib
+pandas
+pandas-datareader
+plotly
+pyarrow
+pyspark
+pytest
+seaborn
+streamlit

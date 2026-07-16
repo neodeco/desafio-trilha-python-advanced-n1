@@ -20,10 +20,15 @@ rad.json
 *.bclicense
 *.flf
 *.txt
+!requirements.txt
+*.log
+*.csv
+*.png
 #Test results file
 TestResults.xml
 #Idea files
 .idea/
-
-/files/COTAHIST_M072025.TXT
+#AI agents folder
 /.agents
+#Pytest cache folder
+.pytest_cache/
