@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import pandas as pd
+import plotly.graph_objects as go
+
+
+def _safe_prefix(filename_prefix: str) -> str:
+    safe_prefix = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in filename_prefix).strip("_")
+    return safe_prefix or "forecast"
 
 
 def plot_comparative_forecast(
@@ -14,44 +21,110 @@ def plot_comparative_forecast(
     output_dir: str | Path = "output/plots",
     filename_prefix: str = "forecast",
 ):
+    """Static comparative chart: red = actual data, black = 365-day future forecast,
+    with the past (test-period) prediction overlaid for comparison."""
     actual = actual_df.copy()
     past = past_predictions.copy()
     future = future_predictions.copy()
 
     for dataframe in (actual, past, future):
-        dataframe["Date"] = pd.to_datetime(dataframe["Date"])
+        dataframe["date"] = pd.to_datetime(dataframe["date"])
 
     fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(actual["Date"], actual["Close"], color="red", linewidth=2, label="Dados reais")
+    ax.plot(actual["date"], actual["close"], color="red", linewidth=2, label="Dados reais")
     ax.plot(
-        past["Date"],
-        past["Predicted"],
+        past["date"],
+        past["predicted"],
         color="#1f77b4",
         linestyle="--",
         linewidth=2,
-        label="Predicao passada",
+        label="Predicao passada (teste)",
     )
     ax.plot(
-        future["Date"],
-        future["Predicted"],
+        future["date"],
+        future["predicted"],
         color="black",
         linewidth=2,
         label="Predicao futura (365 dias)",
     )
 
-    ax.set_xlabel("Ano/Data")
+    ax.set_xlabel("Ano")
     ax.set_ylabel("Preco")
     ax.set_title("Comparativo de preco real e predicoes")
     ax.legend(loc="best")
     ax.grid(alpha=0.25)
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(ax.xaxis.get_major_locator()))
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    safe_prefix = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in filename_prefix).strip("_")
-    file_path = output_path / f"{safe_prefix or 'forecast'}_comparative.png"
+    safe_prefix = _safe_prefix(filename_prefix)
+    file_path = output_path / f"{safe_prefix}_comparative.png"
 
     fig.tight_layout()
     fig.savefig(file_path, dpi=150)
     return fig, file_path
+
+
+def build_interactive_forecast_figure(
+    actual_df: pd.DataFrame,
+    past_predictions: pd.DataFrame,
+    future_predictions: pd.DataFrame,
+    output_dir: str | Path = "output/plots",
+    filename_prefix: str = "forecast",
+) -> tuple[go.Figure, Path]:
+    """Interactive Plotly chart for economists to zoom/hover the final prediction:
+    red = actual data, black = 365-day future forecast, dashed = past prediction."""
+    actual = actual_df.copy()
+    past = past_predictions.copy()
+    future = future_predictions.copy()
+
+    for dataframe in (actual, past, future):
+        dataframe["date"] = pd.to_datetime(dataframe["date"])
+
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=actual["date"],
+            y=actual["close"],
+            mode="lines",
+            name="Dados reais",
+            line={"color": "red", "width": 2},
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=past["date"],
+            y=past["predicted"],
+            mode="lines",
+            name="Predicao passada (teste)",
+            line={"color": "#1f77b4", "width": 2, "dash": "dash"},
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=future["date"],
+            y=future["predicted"],
+            mode="lines",
+            name="Predicao futura (365 dias)",
+            line={"color": "black", "width": 2},
+        )
+    )
+
+    figure.update_layout(
+        title="Predicao final de precos (analise interativa)",
+        xaxis_title="Ano",
+        yaxis_title="Preco",
+        xaxis={"tickformat": "%Y", "rangeslider": {"visible": True}},
+        hovermode="x unified",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02},
+        template="plotly_white",
+    )
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    safe_prefix = _safe_prefix(filename_prefix)
+    file_path = output_path / f"{safe_prefix}_interactive.html"
+    figure.write_html(str(file_path))
+
+    return figure, file_path

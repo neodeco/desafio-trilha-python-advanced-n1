@@ -3,34 +3,58 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
-from scripts.ml_model import train_predict_evaluate
-from scripts.plotting import plot_comparative_forecast
+from scripts import ml_model
+from scripts.ml_model import ModelTrainingError, train_predict_evaluate
+from scripts.plotting import build_interactive_forecast_figure, plot_comparative_forecast
 
 
-def test_train_predict_evaluate_uses_temporal_split_and_future_horizon() -> None:
+@pytest.fixture(autouse=True)
+def _isolate_ml_output_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ml_model, "ANALYSIS_OUTPUT_DIR", tmp_path / "analysis")
+    monkeypatch.setattr(ml_model, "MODEL_TEST_OUTPUT_DIR", tmp_path / "model-test")
+    monkeypatch.setattr(ml_model, "PROCESSED_DATA_OUTPUT_DIR", tmp_path / "processed_stock_data")
+
+
+def test_train_predict_evaluate_uses_temporal_split_and_targets_r2_band() -> None:
     dates = pd.date_range("2024-01-01", periods=80, freq="D")
-    dataframe = pd.DataFrame({"Date": dates, "Close": [100 + index * 0.5 for index in range(80)]})
+    dataframe = pd.DataFrame({"date": dates, "close": [100 + index * 0.5 for index in range(80)]})
 
-    result = train_predict_evaluate(dataframe, future_days=365)
+    result = train_predict_evaluate(dataframe, future_days=365, source_name="TESTE")
 
     assert result.metrics["train_rows"] == 64
     assert result.metrics["test_rows"] == 16
-    assert result.metrics["iterations"] == 1
+    assert result.metrics["iterations"] >= 1
+    assert result.metrics["epochs"] >= 1
     assert len(result.past_predictions) == 16
     assert len(result.future_predictions) == 365
-    assert result.future_predictions["Date"].min() > dataframe["Date"].max()
-    assert float(result.metrics["r2"]) > 0.9
+    assert list(result.past_predictions.columns) == ["date", "close", "predicted"]
+    assert list(result.future_predictions.columns) == ["date", "predicted"]
+    assert result.future_predictions["date"].min() > dataframe["date"].max()
+
+    assert ml_model.TARGET_R2_MIN <= float(result.metrics["r2"]) <= ml_model.TARGET_R2_MAX
+    assert result.metrics["target_reached"] is True
+
+    for artifact_path in result.artifacts.values():
+        assert Path(artifact_path).exists()
+
+
+def test_train_predict_evaluate_requires_minimum_rows() -> None:
+    dataframe = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=5, freq="D"), "close": [1, 2, 3, 4, 5]})
+
+    with pytest.raises(ModelTrainingError):
+        train_predict_evaluate(dataframe)
 
 
 def test_plot_comparative_forecast_saves_png(tmp_path: Path) -> None:
     dates = pd.date_range("2024-01-01", periods=20, freq="D")
-    actual = pd.DataFrame({"Date": dates, "Close": range(20)})
-    past = pd.DataFrame({"Date": dates[-5:], "Close": range(15, 20), "Predicted": range(15, 20)})
+    actual = pd.DataFrame({"date": dates, "close": range(20)})
+    past = pd.DataFrame({"date": dates[-5:], "close": range(15, 20), "predicted": range(15, 20)})
     future = pd.DataFrame(
         {
-            "Date": pd.date_range(dates.max() + pd.Timedelta(days=1), periods=365, freq="D"),
-            "Predicted": range(365),
+            "date": pd.date_range(dates.max() + pd.Timedelta(days=1), periods=365, freq="D"),
+            "predicted": range(365),
         }
     )
 
@@ -42,3 +66,22 @@ def test_plot_comparative_forecast_saves_png(tmp_path: Path) -> None:
         assert path.stat().st_size > 0
     finally:
         fig.clear()
+
+
+def test_build_interactive_forecast_figure_saves_html(tmp_path: Path) -> None:
+    dates = pd.date_range("2024-01-01", periods=20, freq="D")
+    actual = pd.DataFrame({"date": dates, "close": range(20)})
+    past = pd.DataFrame({"date": dates[-5:], "close": range(15, 20), "predicted": range(15, 20)})
+    future = pd.DataFrame(
+        {
+            "date": pd.date_range(dates.max() + pd.Timedelta(days=1), periods=365, freq="D"),
+            "predicted": range(365),
+        }
+    )
+
+    figure, path = build_interactive_forecast_figure(actual, past, future, output_dir=tmp_path, filename_prefix="AAPL")
+
+    assert path.exists()
+    assert path.suffix == ".html"
+    assert path.stat().st_size > 0
+    assert len(figure.data) == 3

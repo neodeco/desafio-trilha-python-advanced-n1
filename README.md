@@ -2,6 +2,25 @@
 
 This workspace now contains a small AWS Glue-style ingestion workflow that can be run locally and adapted to AWS Glue later.
 
+## Architecture (3 layers)
+
+- **Exibicao** (`app/app.py`): Streamlit UI. Accepts either a CSV upload OR a ticker + date range
+  (mutually exclusive - a CSV upload always takes precedence and ignores the ticker/date fields).
+  Renders warnings, metrics, an interactive Plotly chart of the final prediction (for economists'
+  analysis) and a static comparative chart.
+- **Tratamento de dados** (`scripts/data_processing.py`): reads/validates the CSV (auto-detects and
+  corrects the separator if it is not `;`), fetches ticker history via `pandas_datareader`, filters
+  out the 7th distinct ticker when multiple tickers are present, limits the period to the last 365
+  days, converts/validates dates, and produces the final `date`/`close` dataframe. Treated CSV input
+  is saved under `files/analysis/`.
+- **Modelo de machine learning** (`scripts/ml_model.py` + `scripts/plotting.py`): trains a PySpark
+  MLlib `LinearRegression` model with a temporal split (no shuffling) to avoid overfitting, searching
+  epochs/regularization to keep R2 (variance) between 0.90 and 0.97. Reports epochs/iterations, R2,
+  RMSE and MAE; produces a past prediction (compared against the test split) and a 365-day future
+  forecast. Training artifacts go to `output/analysis`, test artifacts to `output/model-test`, and
+  Parquet files from both stages go to `output/processed_stock_data`. Plots are saved to
+  `output/plots`.
+
 ## What is included
 
 - A PySpark transformation job in app/glue_pipeline.py
@@ -9,6 +28,20 @@ This workspace now contains a small AWS Glue-style ingestion workflow that can b
 - A sample raw CSV file in files/raw_stock_data.csv
 - A LocalStack bootstrap script in scripts/setup_localstack.py
 - A regression test in tests/test_glue_pipeline.py
+
+## Install dependencies
+
+```bash
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+## Run the Streamlit app
+
+```bash
+streamlit run app/app.py
+```
 
 ## Run the transformation locally
 
