@@ -33,3 +33,4 @@ TestResults.xml
 #Pytest cache folder
 .pytest_cache/
 __pycache__/
+.venv/
