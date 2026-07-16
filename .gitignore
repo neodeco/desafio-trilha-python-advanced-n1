@@ -28,6 +28,7 @@ rad.json
 TestResults.xml
 #Idea files
 .idea/
-
-/files/COTAHIST_M072025.TXT
+#AI agents folder
 /.agents
+#Pytest cache folder
+.pytest_cache/
