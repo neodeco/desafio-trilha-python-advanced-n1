@@ -32,3 +32,4 @@ TestResults.xml
 /.agents
 #Pytest cache folder
 .pytest_cache/
+__pycache__/

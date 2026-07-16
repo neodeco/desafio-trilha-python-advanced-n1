@@ -87,7 +87,7 @@ def main():
 
         # Run predictive model
         report_lines.append("Running predictive model script...")
-        cmd2 = [sys.executable, "scripts/spark_predictive_model.py", "--training-dir", "files/training-set", "--test-file", "files/test-set/COTAHIST_A2020.TXT", "--output-dir", args.model_output]
+        cmd2 = [sys.executable, "scripts/spark_predictive_model.py", "--training-dir", "files/from-file", "--test-file", "files/test-set/COTAHIST_A2020.TXT", "--output-dir", args.model_output]
         model_out = run_cmd(cmd2)
         report_lines.append("Model output:\n" + model_out)
 
