@@ -12,6 +12,10 @@ on:
       - dev
   workflow_dispatch:
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   validate-branch-flow:
     runs-on: ubuntu-latest
@@ -38,3 +42,46 @@ jobs:
       - name: Run tests
         run: |
           python -m pytest -q || true
+
+  create-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    needs:
+      - validate-branch-flow
+      - build
+    if: github.event_name == 'push' && (github.ref_name == 'dev' || startsWith(github.ref_name, 'feat/'))
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create pull request from feat branch to dev
+        if: startsWith(github.ref_name, 'feat/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_BRANCH: ${{ github.ref_name }}
+        run: |
+          if gh pr list --head "$SOURCE_BRANCH" --base dev --state open --json number --jq 'length' | grep -q '^0$'; then
+            gh pr create \
+              --head "$SOURCE_BRANCH" \
+              --base dev \
+              --title "Merge $SOURCE_BRANCH into dev" \
+              --body "Automatically created pull request from \`$SOURCE_BRANCH\` to \`dev\`."
+          else
+            echo "An open pull request from $SOURCE_BRANCH to dev already exists."
+          fi
+
+      - name: Create pull request from dev to main
+        if: github.ref_name == 'dev'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh pr list --head dev --base main --state open --json number --jq 'length' | grep -q '^0$'; then
+            gh pr create \
+              --head dev \
+              --base main \
+              --title "Merge dev into main" \
+              --body "Automatically created pull request from \`dev\` to \`main\`."
+          else
+            echo "An open pull request from dev to main already exists."
+          fi

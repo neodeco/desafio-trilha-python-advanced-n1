@@ -19,10 +19,26 @@ rad.json
 #License-files
 *.bclicense
 *.flf
+*.txt
+!requirements.txt
+*.log
+*.csv
+*.png
 #Test results file
 TestResults.xml
 #Idea files
 .idea/
-
-/files/COTAHIST_M072025.TXT
+#AI agents folder
 /.agents
+#Pytest cache folder
+.pytest_cache/
+__pycache__/
+*.pyc
+.venv/
+
+#LocalStack persisted volume (certs, license, machine id - local runtime state)
+docker/volume/
+
+#Generated pipeline artifacts (Parquet, plots, model/analysis outputs)
+output/
+*.parquet
