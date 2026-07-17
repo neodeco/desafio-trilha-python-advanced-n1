@@ -9,20 +9,17 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import csv
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import pandas as pd
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-def detect_csv_separator(path: Path) -> str:
-    sample = path.read_text(encoding="utf-8", errors="ignore")[:4096]
-    try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=";,")
-        return dialect.delimiter
-    except Exception:
-        return ";" if sample.count(";") > sample.count(",") else ","
+from scripts.csv_utils import detect_csv_separator_from_path as detect_csv_separator  # noqa: E402
 
 
 def normalize_trade_date(series: pd.Series) -> pd.Series:

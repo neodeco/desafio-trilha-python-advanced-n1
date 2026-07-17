@@ -32,3 +32,13 @@ TestResults.xml
 /.agents
 #Pytest cache folder
 .pytest_cache/
+__pycache__/
+*.pyc
+.venv/
+
+#LocalStack persisted volume (certs, license, machine id - local runtime state)
+docker/volume/
+
+#Generated pipeline artifacts (Parquet, plots, model/analysis outputs)
+output/
+*.parquet
