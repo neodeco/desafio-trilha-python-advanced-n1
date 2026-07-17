@@ -20,6 +20,7 @@ def test_process_csv_input_corrects_non_semicolon_separator_and_formats_dates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(data_processing, "ANALYSIS_OUTPUT_DIR", tmp_path / "analysis")
+    monkeypatch.setattr(data_processing, "FROM_INPUT_DIR", tmp_path / "from-input")
 
     content = (
         "Date,Close\n"
@@ -37,12 +38,16 @@ def test_process_csv_input_corrects_non_semicolon_separator_and_formats_dates(
     assert result.saved_path is not None
     assert result.saved_path.exists()
     assert result.saved_path.suffix == ".csv"
+    assert result.raw_csv_path is not None
+    assert result.raw_csv_path.exists()
+    assert result.raw_csv_path.read_bytes() == content
 
 
 def test_process_csv_input_limits_period_to_last_365_days(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(data_processing, "ANALYSIS_OUTPUT_DIR", tmp_path / "analysis")
+    monkeypatch.setattr(data_processing, "FROM_INPUT_DIR", tmp_path / "from-input")
 
     rows = ["Date;Close"]
     dates = pd.date_range("2018-01-01", "2025-01-01", freq="YS")
@@ -58,6 +63,7 @@ def test_process_csv_input_filters_seventh_ticker_and_warns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(data_processing, "ANALYSIS_OUTPUT_DIR", tmp_path / "analysis")
+    monkeypatch.setattr(data_processing, "FROM_INPUT_DIR", tmp_path / "from-input")
 
     tickers = [f"TICK{i}" for i in range(1, 9)]
     rows = ["symbol;Date;Close"]
@@ -79,6 +85,7 @@ def test_process_csv_input_keeps_data_when_fewer_than_seven_tickers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(data_processing, "ANALYSIS_OUTPUT_DIR", tmp_path / "analysis")
+    monkeypatch.setattr(data_processing, "FROM_INPUT_DIR", tmp_path / "from-input")
 
     rows = [
         "symbol;Date;Close",
@@ -93,19 +100,22 @@ def test_process_csv_input_keeps_data_when_fewer_than_seven_tickers(
     assert any("nao ha um setimo ticker" in warning.lower() for warning in result.warnings)
 
 
-def test_fetch_history_by_ticker_uses_pandas_datareader_and_normalizes(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fetch_history_by_ticker_uses_get_data_yahoo_and_saves_raw_csv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(data_processing, "FROM_INPUT_DIR", tmp_path / "from-input")
+
     module = types.ModuleType("pandas_datareader")
     data_module = types.ModuleType("pandas_datareader.data")
 
-    def fake_data_reader(ticker: str, source: str, start, end):
+    def fake_get_data_yahoo(ticker: str, start=None, end=None):
         assert ticker == "AAPL"
-        assert source == "stooq"
         return pd.DataFrame(
             {"Close": [12.0, 11.0]},
             index=pd.to_datetime(["2024-01-02", "2024-01-01"]),
         )
 
-    data_module.DataReader = fake_data_reader
+    data_module.get_data_yahoo = fake_get_data_yahoo
     module.data = data_module
     monkeypatch.setitem(sys.modules, "pandas_datareader", module)
     monkeypatch.setitem(sys.modules, "pandas_datareader.data", data_module)
@@ -114,6 +124,9 @@ def test_fetch_history_by_ticker_uses_pandas_datareader_and_normalizes(monkeypat
 
     assert result.dataframe["date"].tolist() == [pd.Timestamp("2024-01-01"), pd.Timestamp("2024-01-02")]
     assert result.dataframe["close"].tolist() == [11.0, 12.0]
+    assert result.raw_csv_path is not None
+    assert result.raw_csv_path.exists()
+    assert result.raw_csv_path.name == "AAPL.csv"
 
 
 def test_fetch_history_by_ticker_rejects_invalid_date_range() -> None:
@@ -121,14 +134,18 @@ def test_fetch_history_by_ticker_rejects_invalid_date_range() -> None:
         fetch_history_by_ticker("AAPL", "2024-02-01", "2024-01-01")
 
 
-def test_fetch_history_by_ticker_raises_on_empty_response(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fetch_history_by_ticker_raises_on_empty_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(data_processing, "FROM_INPUT_DIR", tmp_path / "from-input")
+
     module = types.ModuleType("pandas_datareader")
     data_module = types.ModuleType("pandas_datareader.data")
 
-    def fake_data_reader(ticker: str, source: str, start, end):
+    def fake_get_data_yahoo(ticker: str, start=None, end=None):
         return pd.DataFrame()
 
-    data_module.DataReader = fake_data_reader
+    data_module.get_data_yahoo = fake_get_data_yahoo
     module.data = data_module
     monkeypatch.setitem(sys.modules, "pandas_datareader", module)
     monkeypatch.setitem(sys.modules, "pandas_datareader.data", data_module)
@@ -137,14 +154,18 @@ def test_fetch_history_by_ticker_raises_on_empty_response(monkeypatch: pytest.Mo
         fetch_history_by_ticker("INVALIDX", "2024-01-01", "2024-01-02")
 
 
-def test_fetch_history_by_ticker_wraps_network_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fetch_history_by_ticker_wraps_network_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(data_processing, "FROM_INPUT_DIR", tmp_path / "from-input")
+
     module = types.ModuleType("pandas_datareader")
     data_module = types.ModuleType("pandas_datareader.data")
 
-    def fake_data_reader(ticker: str, source: str, start, end):
+    def fake_get_data_yahoo(ticker: str, start=None, end=None):
         raise ConnectionError("network down")
 
-    data_module.DataReader = fake_data_reader
+    data_module.get_data_yahoo = fake_get_data_yahoo
     module.data = data_module
     monkeypatch.setitem(sys.modules, "pandas_datareader", module)
     monkeypatch.setitem(sys.modules, "pandas_datareader.data", data_module)

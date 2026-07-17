@@ -5,8 +5,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from scripts import ml_model
-from scripts.ml_model import ModelTrainingError, train_predict_evaluate
+from scripts import spark_predictive_model as ml_model
+from scripts.spark_predictive_model import ModelTrainingError, train_predict_evaluate
 from scripts.plotting import build_interactive_forecast_figure, plot_comparative_forecast
 
 

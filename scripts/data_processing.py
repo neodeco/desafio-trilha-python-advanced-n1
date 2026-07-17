@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import csv
-import re
+import inspect
+import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -10,10 +10,17 @@ from typing import BinaryIO, TextIO
 
 import pandas as pd
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.csv_utils import detect_csv_separator_from_bytes, slugify  # noqa: E402
+
 
 MAX_PERIOD_DAYS = 365
 SEVENTH_TICKER_POSITION = 7
 ANALYSIS_OUTPUT_DIR = Path("files/analysis")
+FROM_INPUT_DIR = Path("files/from-input")
 
 DATE_COLUMNS = ("Date", "date", "trade_date", "trade_date_fmt", "Data")
 CLOSE_COLUMNS = ("Close", "close", "Adj Close", "adj_close", "Fechamento")
@@ -29,6 +36,7 @@ class ProcessingResult:
     dataframe: pd.DataFrame
     warnings: list[str] = field(default_factory=list)
     saved_path: Path | None = None
+    raw_csv_path: Path | None = None
 
 
 def _read_bytes(source: str | Path | bytes | BinaryIO | TextIO) -> bytes:
@@ -44,12 +52,7 @@ def _read_bytes(source: str | Path | bytes | BinaryIO | TextIO) -> bytes:
 
 
 def detect_csv_separator(content: bytes) -> str:
-    sample = content[:4096].decode("utf-8-sig", errors="ignore")
-    try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=";,")
-        return dialect.delimiter
-    except csv.Error:
-        return ";" if sample.count(";") >= sample.count(",") else ","
+    return detect_csv_separator_from_bytes(content)
 
 
 def _read_csv_auto(content: bytes) -> tuple[pd.DataFrame, list[str]]:
@@ -144,21 +147,69 @@ def _filter_seventh_ticker(dataframe: pd.DataFrame, warnings: list[str]) -> pd.D
     return dataframe[~mask].reset_index(drop=True)
 
 
-def _slugify(text: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_")
-    return safe or "dados"
-
-
 def _save_to_analysis_folder(dataframe: pd.DataFrame, source_name: str) -> Path:
     ANALYSIS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    filename = f"{_slugify(source_name)}_tratado_{timestamp}.csv"
+    filename = f"{slugify(source_name)}_tratado_{timestamp}.csv"
     output_path = ANALYSIS_OUTPUT_DIR / filename
 
     export_df = dataframe.copy()
     export_df["date"] = pd.to_datetime(export_df["date"]).dt.strftime("%d/%m/%Y")
     export_df.to_csv(output_path, index=False, sep=";")
     return output_path
+
+
+def _save_raw_bytes_to_from_input(content: bytes, name: str) -> Path:
+    """Persist the exact raw CSV bytes (as uploaded) to ``files/from-input/{slug}.csv``.
+
+    This is the file that feeds the PySpark ETL pipeline
+    (``app/glue_job.py --mode price-series``), which performs the authoritative
+    date/close normalization in a separate process/JVM, away from Streamlit.
+    """
+    FROM_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = FROM_INPUT_DIR / f"{slugify(name)}.csv"
+    output_path.write_bytes(content)
+    return output_path
+
+
+def _save_raw_dataframe_to_from_input(dataframe: pd.DataFrame, name: str) -> Path:
+    """Persist a raw (untreated) price dataframe to ``files/from-input/{ticker}.csv``.
+
+    Used after fetching data via ``pandas_datareader.data.get_data_yahoo`` so the
+    same PySpark ETL pipeline used for CSV uploads also treats ticker data.
+    """
+    FROM_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = FROM_INPUT_DIR / f"{slugify(name)}.csv"
+    dataframe.to_csv(output_path, index=False)
+    return output_path
+
+
+def _ensure_pandas_datareader_compat() -> None:
+    """Patch ``pandas.util._decorators.deprecate_kwarg`` so that
+    ``pandas_datareader`` (pinned to 0.10.0 for ``get_data_yahoo`` support) can be
+    imported under recent pandas versions.
+
+    Recent pandas releases changed ``deprecate_kwarg``'s signature to require a
+    leading ``klass`` (warning class) argument. ``pandas_datareader`` 0.10.0 still
+    calls it with the old signature, so importing it raises a ``TypeError`` unless
+    we shim the function first. The shim is a no-op on pandas versions that still
+    use the old signature.
+    """
+    import pandas.util._decorators as pd_decorators
+
+    signature = inspect.signature(pd_decorators.deprecate_kwarg)
+    if "klass" not in signature.parameters:
+        return
+    if getattr(pd_decorators.deprecate_kwarg, "_patched_for_pandas_datareader", False):
+        return
+
+    original = pd_decorators.deprecate_kwarg
+
+    def _compat_deprecate_kwarg(old_arg_name, new_arg_name=None, mapping=None, stacklevel=2):
+        return original(FutureWarning, old_arg_name, new_arg_name, mapping, stacklevel)
+
+    _compat_deprecate_kwarg._patched_for_pandas_datareader = True
+    pd_decorators.deprecate_kwarg = _compat_deprecate_kwarg
 
 
 def finalize_price_dataframe(raw_df: pd.DataFrame, warnings: list[str] | None = None) -> ProcessingResult:
@@ -201,14 +252,27 @@ def finalize_price_dataframe(raw_df: pd.DataFrame, warnings: list[str] | None = 
 
 def process_csv_input(source: str | Path | bytes | BinaryIO | TextIO, source_name: str = "csv_enviado") -> ProcessingResult:
     content = _read_bytes(source)
+    raw_csv_path = _save_raw_bytes_to_from_input(content, source_name)
+
     dataframe, warnings = _read_csv_auto(content)
 
     result = finalize_price_dataframe(dataframe, warnings)
     result.saved_path = _save_to_analysis_folder(result.dataframe, source_name)
+    result.raw_csv_path = raw_csv_path
     return result
 
 
 def fetch_history_by_ticker(ticker: str, start_date: date | datetime, end_date: date | datetime) -> ProcessingResult:
+    """Fetch daily price history for ``ticker`` via
+    ``pandas_datareader.data.get_data_yahoo`` and save the raw response to
+    ``files/from-input/{ticker}.csv``.
+
+    The returned :class:`ProcessingResult` also carries a quick pandas-based
+    date/close preview (``result.dataframe``) for immediate UI feedback, but the
+    authoritative treatment is performed afterwards by the PySpark ETL pipeline
+    (``app/glue_job.py --mode price-series``) using ``result.raw_csv_path`` as
+    input, so this function never depends on PySpark/JVM.
+    """
     ticker = ticker.strip().upper()
     if not ticker:
         raise DataProcessingError("Informe um ticker valido.")
@@ -220,6 +284,7 @@ def fetch_history_by_ticker(ticker: str, start_date: date | datetime, end_date: 
     if start > end:
         raise DataProcessingError("A data de inicio deve ser anterior ou igual a data de fim.")
 
+    _ensure_pandas_datareader_compat()
     try:
         from pandas_datareader import data as web
     except ImportError as exc:
@@ -228,13 +293,14 @@ def fetch_history_by_ticker(ticker: str, start_date: date | datetime, end_date: 
         ) from exc
 
     try:
-        raw_df = web.DataReader(ticker, "stooq", start, end)
+        raw_df = web.get_data_yahoo(ticker, start=start, end=end)
     except (ConnectionError, TimeoutError, OSError) as exc:
-        raise DataProcessingError(f"Erro de rede ao buscar historico para {ticker}: {exc}") from exc
+        raise DataProcessingError(f"Erro de rede ao buscar historico para {ticker} via Yahoo Finance: {exc}") from exc
     except Exception as exc:
         message = str(exc).strip() or exc.__class__.__name__
         raise DataProcessingError(
-            f"Nao foi possivel buscar o ticker {ticker}. Verifique se o simbolo e valido: {message}"
+            f"Nao foi possivel buscar o ticker {ticker} via Yahoo Finance (pandas_datareader.get_data_yahoo). "
+            f"Verifique se o simbolo e valido e se o servico esta disponivel: {message}"
         ) from exc
 
     if raw_df is None or raw_df.empty:
@@ -243,7 +309,12 @@ def fetch_history_by_ticker(ticker: str, start_date: date | datetime, end_date: 
     raw_df = raw_df.copy()
     raw_df.index.name = raw_df.index.name or "Date"
     raw_df = raw_df.reset_index()
-    return finalize_price_dataframe(raw_df)
+
+    raw_csv_path = _save_raw_dataframe_to_from_input(raw_df, ticker)
+
+    result = finalize_price_dataframe(raw_df)
+    result.raw_csv_path = raw_csv_path
+    return result
 
 
 def format_dates_for_display(dataframe: pd.DataFrame) -> pd.DataFrame:
