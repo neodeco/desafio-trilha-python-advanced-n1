@@ -105,19 +105,22 @@ def run_forecast_model(treated_csv_path: str, source_name: str) -> dict:
 
 
 def render_metrics(metrics: dict[str, float | int | str | bool]) -> None:
-    cols = st.columns(5)
-    cols[0].metric("R2 (variancia)", f"{float(metrics['r2']):.4f}")
-    cols[1].metric("RMSE", f"{float(metrics['rmse']):.4f}")
-    cols[2].metric("MAE", f"{float(metrics['mae']):.4f}")
-    cols[3].metric("Iteracoes de busca", f"{int(metrics['iterations'])}")
-    cols[4].metric("Epocas do modelo", f"{int(metrics['epochs'])}")
+    cols = st.columns(6)
+    cols[0].metric("R2 treino", f"{float(metrics['train_r2']):.4f}")
+    cols[1].metric("R2 teste", f"{float(metrics['test_r2']):.4f}")
+    cols[2].metric("RMSE", f"{float(metrics['rmse']):.4f}")
+    cols[3].metric("MAE", f"{float(metrics['mae']):.4f}")
+    cols[4].metric("Iteracoes de busca", f"{int(metrics['iterations'])}")
+    cols[5].metric("Epocas do modelo", f"{int(metrics['epochs'])}")
 
-    target_status = "atingido" if metrics["target_reached"] else "nao atingido"
+    train_target_status = "atingido" if metrics["train_target_reached"] else "nao atingido"
+    test_target_status = "atingido" if metrics["test_target_reached"] else "nao atingido"
     st.caption(
         f"Modelo: {metrics['model']} | Split temporal (sem shuffle): "
         f"{metrics['train_rows']} treino / {metrics['test_rows']} teste | "
-        f"Faixa de R2 alvo [{metrics['target_r2_min']:.2f} - {metrics['target_r2_max']:.2f}] {target_status}; "
-        f"valor real {float(metrics['r2']):.4f}."
+        f"Faixa de R2 alvo [{metrics['target_r2_min']:.2f} - {metrics['target_r2_max']:.2f}] | "
+        f"treino {train_target_status} ({float(metrics['train_r2']):.4f}) | "
+        f"teste {test_target_status} ({float(metrics['test_r2']):.4f})."
     )
 
 

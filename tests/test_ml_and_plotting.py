@@ -19,7 +19,7 @@ def _isolate_ml_output_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_train_predict_evaluate_uses_temporal_split_and_targets_r2_band() -> None:
     dates = pd.date_range("2024-01-01", periods=80, freq="D")
-    dataframe = pd.DataFrame({"date": dates, "close": [100 + index * 0.5 for index in range(80)]})
+    dataframe = pd.DataFrame({"ticker": ["TESTE"] * len(dates), "date": dates, "close": [100 + index * 0.5 for index in range(80)]})
 
     result = train_predict_evaluate(dataframe, future_days=365, source_name="TESTE")
 
@@ -33,7 +33,13 @@ def test_train_predict_evaluate_uses_temporal_split_and_targets_r2_band() -> Non
     assert list(result.future_predictions.columns) == ["date", "predicted"]
     assert result.future_predictions["date"].min() > dataframe["date"].max()
 
-    assert ml_model.TARGET_R2_MIN <= float(result.metrics["r2"]) <= ml_model.TARGET_R2_MAX
+    assert list(pd.read_parquet(result.artifacts["train_parquet"]).columns) == ["ticker", "date", "close"]
+    assert list(pd.read_parquet(result.artifacts["test_parquet"]).columns) == ["ticker", "date", "close"]
+    assert ml_model.TARGET_R2_MIN <= float(result.metrics["train_r2"]) <= ml_model.TARGET_R2_MAX
+    assert ml_model.TARGET_R2_MIN <= float(result.metrics["test_r2"]) <= ml_model.TARGET_R2_MAX
+    assert float(result.metrics["test_r2"]) == float(result.metrics["r2"])
+    assert result.metrics["train_target_reached"] is True
+    assert result.metrics["test_target_reached"] is True
     assert result.metrics["target_reached"] is True
 
     for artifact_path in result.artifacts.values():

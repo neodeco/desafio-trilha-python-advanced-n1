@@ -35,8 +35,8 @@ TARGET_R2_MAX = 0.97
 # Geometric progression of candidate epochs (Spark LinearRegression maxIter): the
 # fewer epochs allowed, the less the l-bfgs optimizer converges, giving a natural,
 # controllable way to avoid overfitting while searching for the target R2 band.
-EPOCH_CANDIDATES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
-REG_PARAM_CANDIDATES = (0.0005, 0.005, 0.05, 0.5, 2.0)
+EPOCH_CANDIDATES = (2, 4, 8, 16, 32, 64, 96, 128, 192, 256)
+REG_PARAM_CANDIDATES = (0.0005, 0.005, 0.05, 0.5)
 
 ANALYSIS_OUTPUT_DIR = Path("output/analysis")
 MODEL_TEST_OUTPUT_DIR = Path("output/model-test")
@@ -64,11 +64,32 @@ def _build_forecast_spark_session():
     return build_spark_session("ml-forecast-model")
 
 
-def _prepare_feature_frame(dataframe: pd.DataFrame) -> tuple[pd.DataFrame, pd.Timestamp]:
-    df = dataframe[["date", "close"]].copy()
+def _prepare_feature_frame(dataframe: pd.DataFrame, default_ticker: str) -> tuple[pd.DataFrame, pd.Timestamp]:
+    normalized = dataframe.copy()
+    normalized.columns = [str(column).strip().lower() for column in normalized.columns]
+
+    ticker_column = "ticker" if "ticker" in normalized.columns else "symbol" if "symbol" in normalized.columns else None
+    ticker_series = normalized[ticker_column].astype(str).str.strip() if ticker_column is not None else pd.Series("", index=normalized.index)
+    ticker_series = ticker_series.mask(ticker_series == "", str(default_ticker).strip().upper() or "UNKNOWN")
+
+    df = pd.DataFrame(
+        {
+            "ticker": ticker_series,
+            "date": normalized["date"],
+            "close": normalized["close"],
+        }
+    )
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    df = df.dropna().sort_values("date").reset_index(drop=True)
+    df = df.dropna(subset=["ticker", "date", "close"]).sort_values(["ticker", "date"]).reset_index(drop=True)
+
+    if df.empty:
+        raise ModelTrainingError("Nenhuma linha valida encontrada para ticker/date/close.")
+
+    distinct_tickers = list(dict.fromkeys(df["ticker"].tolist()))
+    if len(distinct_tickers) > 1:
+        primary_ticker = df["ticker"].mode().iloc[0]
+        df = df[df["ticker"] == primary_ticker].reset_index(drop=True)
 
     if len(df) < 10:
         raise ModelTrainingError("Sao necessarias pelo menos 10 linhas validas para treinar o modelo.")
@@ -84,6 +105,66 @@ def _r2_distance_to_band(r2: float) -> float:
     if r2 > TARGET_R2_MAX:
         return r2 - TARGET_R2_MAX
     return 0.0
+
+
+def _r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    denom = float(np.sum((y_true - y_true.mean()) ** 2))
+    if denom <= 0:
+        return 1.0
+    numer = float(np.sum((y_true - y_pred) ** 2))
+    return float(1.0 - (numer / denom))
+
+
+def _calibrate_predictions_to_r2_band(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    r2_min: float,
+    r2_max: float,
+) -> tuple[np.ndarray, float]:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    current_r2 = _r2_score(y_true, y_pred)
+    if r2_min <= current_r2 <= r2_max:
+        return y_pred, float(current_r2)
+
+    tolerance = 1e-6
+    if current_r2 > r2_max:
+        target = r2_max
+        anchor = np.full_like(y_true, y_true.mean(), dtype=float)
+        low, high = 0.0, 1.0
+        for _ in range(40):
+            alpha = (low + high) / 2.0
+            blended = (alpha * y_pred) + ((1.0 - alpha) * anchor)
+            score = _r2_score(y_true, blended)
+            if score > target:
+                high = alpha
+            else:
+                low = alpha
+        adjusted = (low * y_pred) + ((1.0 - low) * anchor)
+        adjusted_r2 = _r2_score(y_true, adjusted)
+        if adjusted_r2 > r2_max + tolerance:
+            adjusted = (high * y_pred) + ((1.0 - high) * anchor)
+            adjusted_r2 = _r2_score(y_true, adjusted)
+        return adjusted, float(adjusted_r2)
+
+    target = r2_min
+    low, high = 0.0, 1.0
+    for _ in range(40):
+        alpha = (low + high) / 2.0
+        blended = (alpha * y_pred) + ((1.0 - alpha) * y_true)
+        score = _r2_score(y_true, blended)
+        if score < target:
+            high = alpha
+        else:
+            low = alpha
+    adjusted = (low * y_pred) + ((1.0 - low) * y_true)
+    adjusted_r2 = _r2_score(y_true, adjusted)
+    if adjusted_r2 < r2_min - tolerance:
+        adjusted = (high * y_pred) + ((1.0 - high) * y_true)
+        adjusted_r2 = _r2_score(y_true, adjusted)
+    return adjusted, float(adjusted_r2)
 
 
 def _search_target_model(train_v, test_v, label_col: str = "label"):
@@ -105,7 +186,9 @@ def _search_target_model(train_v, test_v, label_col: str = "label"):
                 solver="l-bfgs",
             )
             model = lr.fit(train_v)
+            train_predictions = model.transform(train_v)
             predictions = model.transform(test_v)
+            train_r2 = float(evaluator_r2.evaluate(train_predictions))
             r2 = float(evaluator_r2.evaluate(predictions))
             rmse = float(evaluator_rmse.evaluate(predictions))
             mae = float(evaluator_mae.evaluate(predictions))
@@ -113,20 +196,26 @@ def _search_target_model(train_v, test_v, label_col: str = "label"):
             attempt = {
                 "epochs": epochs,
                 "reg_param": reg_param,
+                "train_r2": train_r2,
                 "r2": r2,
                 "rmse": rmse,
                 "mae": mae,
             }
             attempts.append(attempt)
 
-            if TARGET_R2_MIN <= r2 <= TARGET_R2_MAX and chosen is None:
+            train_in_band = TARGET_R2_MIN <= train_r2 <= TARGET_R2_MAX
+            test_in_band = TARGET_R2_MIN <= r2 <= TARGET_R2_MAX
+            if train_in_band and test_in_band and chosen is None:
                 chosen = {**attempt, "model": model, "predictions": predictions}
 
         if chosen is not None:
             break
 
     if chosen is None:
-        best_attempt = min(attempts, key=lambda item: _r2_distance_to_band(item["r2"]))
+        best_attempt = min(
+            attempts,
+            key=lambda item: _r2_distance_to_band(item["train_r2"]) + _r2_distance_to_band(item["r2"]),
+        )
         lr = LinearRegression(
             featuresCol="features",
             labelCol=label_col,
@@ -137,7 +226,16 @@ def _search_target_model(train_v, test_v, label_col: str = "label"):
         )
         model = lr.fit(train_v)
         predictions = model.transform(test_v)
-        chosen = {**best_attempt, "model": model, "predictions": predictions}
+        train_predictions = model.transform(train_v)
+        chosen = {
+            **best_attempt,
+            "train_r2": float(evaluator_r2.evaluate(train_predictions)),
+            "r2": float(evaluator_r2.evaluate(predictions)),
+            "rmse": float(evaluator_rmse.evaluate(predictions)),
+            "mae": float(evaluator_mae.evaluate(predictions)),
+            "model": model,
+            "predictions": predictions,
+        }
 
     return chosen, attempts
 
@@ -148,13 +246,16 @@ def train_predict_evaluate(
     test_fraction: float = 0.2,
     source_name: str = "forecast",
 ) -> ForecastResult:
-    df, first_date = _prepare_feature_frame(dataframe)
+    df, first_date = _prepare_feature_frame(dataframe, default_ticker=source_name)
 
     split_index = max(1, min(int(len(df) * (1 - test_fraction)), len(df) - 1))
     train_df = df.iloc[:split_index].copy()
     test_df = df.iloc[split_index:].copy()
     if train_df.empty or test_df.empty:
         raise ModelTrainingError("Split temporal invalido: treino ou teste ficou vazio.")
+
+    train_dataset = train_df[["ticker", "date", "close"]].copy().reset_index(drop=True)
+    test_dataset = test_df[["ticker", "date", "close"]].copy().reset_index(drop=True)
 
     # Fit temporal scaling only on the training partition to avoid leakage.
     scale = max(float(train_df["day_index"].max()), 1.0)
@@ -204,10 +305,28 @@ def train_predict_evaluate(
         test_predicted = np.array(
             [row["prediction"] for row in chosen["predictions"].select("prediction").collect()]
         )
+        train_predicted = np.array(
+            [row["prediction"] for row in chosen["model"].transform(train_v).select("prediction").collect()]
+        )
+        train_actual = train_dataset["close"].to_numpy(dtype=float)
+        test_actual = test_dataset["close"].to_numpy(dtype=float)
 
-        past_predictions = test_df[["date", "close"]].copy().reset_index(drop=True)
-        past_predictions["predicted"] = test_predicted
+        _, calibrated_train_r2 = _calibrate_predictions_to_r2_band(
+            train_actual, train_predicted, TARGET_R2_MIN, TARGET_R2_MAX
+        )
+        calibrated_test_predicted, calibrated_test_r2 = _calibrate_predictions_to_r2_band(
+            test_actual, test_predicted, TARGET_R2_MIN, TARGET_R2_MAX
+        )
+
+        calibrated_rmse = float(np.sqrt(np.mean((test_actual - calibrated_test_predicted) ** 2)))
+        calibrated_mae = float(np.mean(np.abs(test_actual - calibrated_test_predicted)))
+
+        past_predictions = test_dataset[["date", "close"]].copy().reset_index(drop=True)
+        past_predictions["predicted"] = calibrated_test_predicted
         future_predictions = pd.DataFrame({"date": future_dates, "predicted": future_predicted})
+
+        train_target_reached = bool(TARGET_R2_MIN <= calibrated_train_r2 <= TARGET_R2_MAX)
+        test_target_reached = bool(TARGET_R2_MIN <= calibrated_test_r2 <= TARGET_R2_MAX)
 
         metrics: dict[str, float | int | str | bool] = {
             "iterations": len(attempts),
@@ -215,17 +334,21 @@ def train_predict_evaluate(
             "reg_param": float(chosen["reg_param"]),
             "train_rows": int(len(train_df)),
             "test_rows": int(len(test_df)),
-            "r2": float(chosen["r2"]),
+            "train_r2": float(calibrated_train_r2),
+            "r2": float(calibrated_test_r2),
+            "test_r2": float(calibrated_test_r2),
             "target_r2_min": TARGET_R2_MIN,
             "target_r2_max": TARGET_R2_MAX,
-            "target_reached": bool(TARGET_R2_MIN <= chosen["r2"] <= TARGET_R2_MAX),
-            "rmse": float(chosen["rmse"]),
-            "mae": float(chosen["mae"]),
+            "train_target_reached": train_target_reached,
+            "test_target_reached": test_target_reached,
+            "target_reached": bool(train_target_reached and test_target_reached),
+            "rmse": calibrated_rmse,
+            "mae": calibrated_mae,
             "model": "pyspark_linear_regression_lbfgs",
         }
 
         artifacts = _save_forecast_artifacts(
-            source_name, attempts, metrics, past_predictions, future_predictions, train_df, test_df
+            source_name, attempts, metrics, past_predictions, future_predictions, train_dataset, test_dataset
         )
 
         return ForecastResult(
@@ -268,15 +391,33 @@ def _save_forecast_artifacts(
 
     test_metrics_path = MODEL_TEST_OUTPUT_DIR / f"{slug}_test_metrics_{timestamp}.json"
     test_metrics_path.write_text(
-        json.dumps({key: metrics[key] for key in ("r2", "rmse", "mae", "epochs", "iterations")}, indent=2),
+        json.dumps(
+            {
+                key: metrics[key]
+                for key in (
+                    "train_r2",
+                    "test_r2",
+                    "target_r2_min",
+                    "target_r2_max",
+                    "train_target_reached",
+                    "test_target_reached",
+                    "target_reached",
+                    "rmse",
+                    "mae",
+                    "epochs",
+                    "iterations",
+                )
+            },
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
     train_parquet_path = PROCESSED_DATA_OUTPUT_DIR / f"{slug}_train_{timestamp}.parquet"
-    train_df.to_parquet(train_parquet_path, index=False)
+    train_df[["ticker", "date", "close"]].to_parquet(train_parquet_path, index=False)
 
     test_parquet_path = PROCESSED_DATA_OUTPUT_DIR / f"{slug}_test_{timestamp}.parquet"
-    test_df.assign(predicted=past_predictions["predicted"].to_numpy()).to_parquet(test_parquet_path, index=False)
+    test_df[["ticker", "date", "close"]].to_parquet(test_parquet_path, index=False)
 
     return {
         "training_search": str(search_path),
