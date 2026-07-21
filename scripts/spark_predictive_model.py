@@ -64,7 +64,7 @@ def _build_forecast_spark_session():
     return build_spark_session("ml-forecast-model")
 
 
-def _prepare_feature_frame(dataframe: pd.DataFrame) -> tuple[pd.DataFrame, pd.Timestamp, float]:
+def _prepare_feature_frame(dataframe: pd.DataFrame) -> tuple[pd.DataFrame, pd.Timestamp]:
     df = dataframe[["date", "close"]].copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
@@ -75,10 +75,7 @@ def _prepare_feature_frame(dataframe: pd.DataFrame) -> tuple[pd.DataFrame, pd.Ti
 
     first_date = df["date"].min()
     df["day_index"] = (df["date"] - first_date).dt.days.astype(float)
-    scale = max(float(df["day_index"].max()), 1.0)
-    df["t"] = df["day_index"] / scale
-    df["t2"] = df["t"] ** 2
-    return df, first_date, scale
+    return df, first_date
 
 
 def _r2_distance_to_band(r2: float) -> float:
@@ -151,13 +148,20 @@ def train_predict_evaluate(
     test_fraction: float = 0.2,
     source_name: str = "forecast",
 ) -> ForecastResult:
-    df, first_date, scale = _prepare_feature_frame(dataframe)
+    df, first_date = _prepare_feature_frame(dataframe)
 
     split_index = max(1, min(int(len(df) * (1 - test_fraction)), len(df) - 1))
     train_df = df.iloc[:split_index].copy()
     test_df = df.iloc[split_index:].copy()
     if train_df.empty or test_df.empty:
         raise ModelTrainingError("Split temporal invalido: treino ou teste ficou vazio.")
+
+    # Fit temporal scaling only on the training partition to avoid leakage.
+    scale = max(float(train_df["day_index"].max()), 1.0)
+    df["t"] = df["day_index"] / scale
+    df["t2"] = df["t"] ** 2
+    train_df = df.iloc[:split_index].copy()
+    test_df = df.iloc[split_index:].copy()
 
     spark = _build_forecast_spark_session()
     try:
@@ -394,6 +398,20 @@ def build_features(df, symbol_filter=None):
     )
 
 
+def temporal_train_validation_split(data, validation_fraction: float = 0.2):
+    total_rows = data.count()
+    if total_rows < 2:
+        raise RuntimeError("At least 2 rows are required to create temporal train/validation splits.")
+
+    split_index = max(1, min(int(total_rows * (1 - validation_fraction)), total_rows - 1))
+    order_window = Window.orderBy(F.col("trade_date_fmt").asc())
+    indexed = data.withColumn("row_num", F.row_number().over(order_window))
+
+    train_set = indexed.filter(F.col("row_num") <= split_index).drop("row_num")
+    val_set = indexed.filter(F.col("row_num") > split_index).drop("row_num")
+    return train_set, val_set
+
+
 def train_and_evaluate(training_df, validation_df, output_dir: Path):
     models = {
         "linear_regression": LinearRegression(featuresCol="features", labelCol="label", maxIter=50),
@@ -460,7 +478,7 @@ def _run_legacy_training_cli(args: argparse.Namespace) -> None:
         print(f"Selected symbol for modeling: {args.symbol}")
 
     data = build_features(training_df, symbol_filter=args.symbol)
-    train_set, val_set = data.randomSplit([0.8, 0.2], seed=42)
+    train_set, val_set = temporal_train_validation_split(data, validation_fraction=0.2)
     print(f"Training rows: {train_set.count()}, validation rows: {val_set.count()}")
 
     _, best_model = train_and_evaluate(train_set, val_set, Path(args.output_dir))
