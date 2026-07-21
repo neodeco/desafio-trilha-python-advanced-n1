@@ -191,7 +191,7 @@ st.caption(
 
 # Step 3: PySpark forecast model (subprocess) --------------------------------
 try:
-    with st.spinner("Treinando e avaliando o modelo com PySpark (scripts/spark_predictive_model.py)..."):
+    with st.spinner("Executando treino/predicao com PySpark (scripts/spark_predictive_model.py)..."):
         forecast_summary = run_forecast_model(etl_summary["csv_path"], source_slug)
 except SubprocessJobError as exc:
     st.error(f"Erro inesperado ao treinar o modelo: {exc}")
@@ -215,19 +215,23 @@ interactive_fig, interactive_path = build_interactive_forecast_figure(
     past_predictions=past_predictions,
     future_predictions=future_predictions,
     filename_prefix=source_label,
+    ticker=source_label,
 )
 fig, plot_path = plot_comparative_forecast(
     actual_df=final_df,
     past_predictions=past_predictions,
     future_predictions=future_predictions,
     filename_prefix=source_label,
+    ticker=source_label,
 )
 
 st.subheader("Metricas")
 render_metrics(metrics)
+if bool(metrics.get("from_cache", False)):
+    st.info("Dados de ticker e periodo ja treinados anteriormente. Predicoes reaproveitadas do cache.")
 
-st.subheader("Predicao final (analise interativa para economistas)")
-st.plotly_chart(interactive_fig, use_container_width=True)
+st.subheader(f"Predicao final para {source_label} (analise interativa para economistas)")
+st.plotly_chart(interactive_fig)
 st.caption(f"Grafico interativo salvo em {interactive_path}")
 
 st.subheader("Grafico comparativo")

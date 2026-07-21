@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import sys
@@ -41,6 +42,7 @@ REG_PARAM_CANDIDATES = (0.0005, 0.005, 0.05, 0.5)
 ANALYSIS_OUTPUT_DIR = Path("output/analysis")
 MODEL_TEST_OUTPUT_DIR = Path("output/model-test")
 PROCESSED_DATA_OUTPUT_DIR = Path("output/processed_stock_data")
+FORECAST_CACHE_INDEX_PATH = ANALYSIS_OUTPUT_DIR / "forecast_cache_index.json"
 
 
 class ModelTrainingError(RuntimeError):
@@ -53,6 +55,92 @@ class ForecastResult:
     past_predictions: pd.DataFrame
     future_predictions: pd.DataFrame
     artifacts: dict[str, str] = field(default_factory=dict)
+
+
+def _load_forecast_cache_index() -> dict[str, dict]:
+    if not FORECAST_CACHE_INDEX_PATH.exists():
+        return {}
+    try:
+        return json.loads(FORECAST_CACHE_INDEX_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_forecast_cache_index(index: dict[str, dict]) -> None:
+    ANALYSIS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    FORECAST_CACHE_INDEX_PATH.write_text(json.dumps(index, indent=2), encoding="utf-8")
+
+
+def _build_forecast_cache_key(
+    prepared_dataframe: pd.DataFrame,
+    source_name: str,
+    future_days: int,
+    test_fraction: float,
+) -> str:
+    ticker = str(prepared_dataframe["ticker"].mode().iloc[0]).strip().upper()
+    min_date = prepared_dataframe["date"].min().date().isoformat()
+    max_date = prepared_dataframe["date"].max().date().isoformat()
+    row_count = int(len(prepared_dataframe))
+
+    hasher = hashlib.sha256()
+    hasher.update(ticker.encode("utf-8"))
+    hasher.update(min_date.encode("utf-8"))
+    hasher.update(max_date.encode("utf-8"))
+    hasher.update(str(row_count).encode("utf-8"))
+    hasher.update(str(future_days).encode("utf-8"))
+    hasher.update(f"{test_fraction:.8f}".encode("utf-8"))
+    hasher.update(source_name.strip().upper().encode("utf-8"))
+
+    dates_as_int = prepared_dataframe["date"].astype("int64").to_numpy()
+    close_values = np.round(prepared_dataframe["close"].to_numpy(dtype=float), 8)
+    hasher.update(dates_as_int.tobytes())
+    hasher.update(close_values.tobytes())
+    return hasher.hexdigest()
+
+
+def _load_cached_forecast_result(cache_key: str) -> ForecastResult | None:
+    index = _load_forecast_cache_index()
+    entry = index.get(cache_key)
+    if entry is None:
+        return None
+
+    artifacts = entry.get("artifacts", {})
+    required_artifacts = ("training_metrics", "test_predictions", "future_predictions")
+    if any(path_key not in artifacts for path_key in required_artifacts):
+        return None
+    if any(not Path(artifacts[path_key]).exists() for path_key in artifacts):
+        return None
+
+    metrics_path = Path(artifacts["training_metrics"])
+    test_predictions_path = Path(artifacts["test_predictions"])
+    future_predictions_path = Path(artifacts["future_predictions"])
+    if not metrics_path.exists() or not test_predictions_path.exists() or not future_predictions_path.exists():
+        return None
+
+    try:
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        past_predictions = pd.read_csv(test_predictions_path)
+        future_predictions = pd.read_csv(future_predictions_path)
+    except (json.JSONDecodeError, OSError, pd.errors.ParserError):
+        return None
+
+    if "date" in past_predictions.columns:
+        past_predictions["date"] = pd.to_datetime(past_predictions["date"], errors="coerce")
+    if "date" in future_predictions.columns:
+        future_predictions["date"] = pd.to_datetime(future_predictions["date"], errors="coerce")
+
+    metrics["from_cache"] = True
+    metrics["cache_key"] = cache_key
+    return ForecastResult(metrics=metrics, past_predictions=past_predictions, future_predictions=future_predictions, artifacts=artifacts)
+
+
+def _register_forecast_cache(cache_key: str, artifacts: dict[str, str]) -> None:
+    index = _load_forecast_cache_index()
+    index[cache_key] = {
+        "artifacts": artifacts,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _save_forecast_cache_index(index)
 
 
 def _build_forecast_spark_session():
@@ -345,6 +433,7 @@ def train_predict_evaluate(
             "rmse": calibrated_rmse,
             "mae": calibrated_mae,
             "model": "pyspark_linear_regression_lbfgs",
+            "from_cache": False,
         }
 
         artifacts = _save_forecast_artifacts(
@@ -445,7 +534,27 @@ def run_forecast_from_csv(
     csv_sep = detect_csv_separator(csv_path) if sep == "auto" else sep
     dataframe = pd.read_csv(csv_path, sep=csv_sep)
     dataframe.columns = [str(column).strip().lower() for column in dataframe.columns]
-    return train_predict_evaluate(dataframe, future_days=future_days, test_fraction=test_fraction, source_name=source_name)
+
+    prepared_df, _ = _prepare_feature_frame(dataframe, default_ticker=source_name)
+    cache_key = _build_forecast_cache_key(
+        prepared_dataframe=prepared_df,
+        source_name=source_name,
+        future_days=future_days,
+        test_fraction=test_fraction,
+    )
+    cached_result = _load_cached_forecast_result(cache_key)
+    if cached_result is not None:
+        return cached_result
+
+    result = train_predict_evaluate(
+        dataframe,
+        future_days=future_days,
+        test_fraction=test_fraction,
+        source_name=source_name,
+    )
+    _register_forecast_cache(cache_key, result.artifacts)
+    result.metrics["cache_key"] = cache_key
+    return result
 
 
 # --- Legacy multi-symbol OHLCV training (COTAHIST-style training-set) -------

@@ -20,6 +20,7 @@ def plot_comparative_forecast(
     future_predictions: pd.DataFrame,
     output_dir: str | Path = "output/plots",
     filename_prefix: str = "forecast",
+    ticker: str | None = None,
 ):
     """Static comparative chart: red = actual data, black = 365-day future forecast,
     with the past (test-period) prediction overlaid for comparison."""
@@ -50,7 +51,8 @@ def plot_comparative_forecast(
 
     ax.set_xlabel("Ano")
     ax.set_ylabel("Preco")
-    ax.set_title("Comparativo de preco real e predicoes")
+    title_suffix = f" - {ticker}" if ticker else ""
+    ax.set_title(f"Comparativo de preco real e predicoes{title_suffix}")
     ax.legend(loc="best")
     ax.grid(alpha=0.25)
     ax.xaxis.set_major_locator(mdates.YearLocator())
@@ -72,6 +74,7 @@ def build_interactive_forecast_figure(
     future_predictions: pd.DataFrame,
     output_dir: str | Path = "output/plots",
     filename_prefix: str = "forecast",
+    ticker: str | None = None,
 ) -> tuple[go.Figure, Path]:
     """Interactive Plotly chart for economists to zoom/hover the final prediction:
     red = actual data, black = 365-day future forecast, dashed = past prediction."""
@@ -111,11 +114,17 @@ def build_interactive_forecast_figure(
         )
     )
 
+    title_suffix = f" - {ticker}" if ticker else ""
     figure.update_layout(
-        title="Predicao final de precos (analise interativa)",
-        xaxis_title="Ano",
+        title=f"Predicao final de precos (analise interativa){title_suffix}",
+        xaxis_title="Data (marcacao de 15 em 15 dias)",
         yaxis_title="Preco",
-        xaxis={"tickformat": "%Y", "rangeslider": {"visible": True}},
+        xaxis={
+            "tickformat": "%d/%m<br>%b/%Y",
+            "dtick": 15 * 24 * 60 * 60 * 1000,
+            "tickangle": -30,
+            "rangeslider": {"visible": True},
+        },
         hovermode="x unified",
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02},
         template="plotly_white",

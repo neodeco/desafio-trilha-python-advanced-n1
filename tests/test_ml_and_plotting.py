@@ -91,3 +91,33 @@ def test_build_interactive_forecast_figure_saves_html(tmp_path: Path) -> None:
     assert path.suffix == ".html"
     assert path.stat().st_size > 0
     assert len(figure.data) == 3
+    assert figure.layout.xaxis.dtick == 15 * 24 * 60 * 60 * 1000
+    assert "%b/%Y" in str(figure.layout.xaxis.tickformat)
+
+
+def test_run_forecast_from_csv_reuses_cached_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ml_model, "ANALYSIS_OUTPUT_DIR", tmp_path / "analysis")
+    monkeypatch.setattr(ml_model, "MODEL_TEST_OUTPUT_DIR", tmp_path / "model-test")
+    monkeypatch.setattr(ml_model, "PROCESSED_DATA_OUTPUT_DIR", tmp_path / "processed_stock_data")
+    monkeypatch.setattr(ml_model, "FORECAST_CACHE_INDEX_PATH", (tmp_path / "analysis" / "forecast_cache_index.json"))
+
+    csv_path = tmp_path / "treated.csv"
+    dataframe = pd.DataFrame(
+        {
+            "date": pd.date_range("2024-01-01", periods=12, freq="D"),
+            "close": [10 + index * 0.2 for index in range(12)],
+        }
+    )
+    dataframe.to_csv(csv_path, index=False, sep=";")
+
+    first = ml_model.run_forecast_from_csv(csv_path, source_name="AAPL")
+    assert first.metrics["from_cache"] is False
+
+    def _should_not_train(*args, **kwargs):
+        raise AssertionError("training should not run when cache entry exists")
+
+    monkeypatch.setattr(ml_model, "train_predict_evaluate", _should_not_train)
+    second = ml_model.run_forecast_from_csv(csv_path, source_name="AAPL")
+
+    assert second.metrics["from_cache"] is True
+    assert second.artifacts["test_predictions"] == first.artifacts["test_predictions"]
