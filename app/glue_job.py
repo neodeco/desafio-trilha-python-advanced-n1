@@ -4,7 +4,7 @@ Supports two modes:
   - ``stock`` (default): legacy OHLCV transformation for COTAHIST-style
     multi-symbol training data (`transform_stock_data`).
   - ``price-series``: normalizes any raw price CSV (ticker download from
-    `pandas_datareader.data.get_data_yahoo` or a user-uploaded CSV) into a
+    `yfinance.download` or a user-uploaded CSV) into a
     clean ``date``/``close`` series using PySpark SQL, writes the treated CSV
     to `files/from-file/` (consumed by `scripts/localstack_pipeline_test.py`
     and `scripts/spark_predictive_model.py`), writes an optimized Parquet

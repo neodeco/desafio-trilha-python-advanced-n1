@@ -229,7 +229,7 @@ PY
 ## Como Executar de Ponta a Ponta (End-to-End)
 
 1. Ative o ambiente virtual Python.
-2. Obtenha um CSV de preços brutos: busque um ticker via `pandas_datareader.data.get_data_yahoo` (através de `app/app.py`, que o salva em `files/from-input/{ticker}.csv`) ou faça o upload de um CSV.
+2. Obtenha um CSV de preços brutos: busque um ticker via `yfinance.download` (através de `app/app.py`, que o salva em `files/from-input/{ticker}.csv`) ou faça o upload de um CSV.
 3. Execute o job de ETL do PySpark: `python -m app.glue_job --mode price-series --input files/from-input/AAPL.csv --source-name AAPL`.
 Isso irá gravar `files/from-file/AAPL.csv` (`date;close`), `output/processed_stock_data/AAPL.parquet` e fazer o upload do arquivo Parquet para o bucket S3 do LocalStack chamado `processed-data`.
 4. Execute o modelo de previsão: `python -m scripts.spark_predictive_model --mode forecast --forecast-input files/from-file/AAPL.csv --source-name AAPL`.
@@ -279,13 +279,12 @@ Todo o trabalho do PySpark agora roda em subprocessos independentes invocados a 
 * `python -m app.glue_job --mode price-series --input <raw.csv> --source-name <slug>` (ETL do PySpark)
 * `python -m scripts.spark_predictive_model --mode forecast --forecast-input <treated.csv> --source-name <slug>` (PySpark MLlib)
 
-### `pandas_datareader.data.get_data_yahoo`
+### `yfinance.download`
 
-Conforme solicitado, o histórico do ticker é buscado com `pandas_datareader.data.get_data_yahoo` em vez da chamada anterior `DataReader(ticker, "stooq", ...)` (que já estava quebrada na origem).
+Conforme solicitado, o histórico do ticker é buscado com `yfinance.download` em vez da chamada anterior `pandas_datareader.data.get_data_yahoo`.
 
-* O `pandas-datareader` 0.11.1 (última versão disponível até o momento) removeu completamente o `get_data_yahoo` e a fonte `"stooq"`, portanto o código anterior já não funcionava com a versão instalada.
-* O `pandas-datareader==0.10.0` ainda possui o `get_data_yahoo`, mas sua importação quebra nas versões recentes do pandas devido à função `pandas.util._decorators.deprecate_kwarg` ter recebido um argumento obrigatório `klass` no início. O arquivo `scripts/data_processing.py::_ensure_pandas_datareader_compat()` realiza o *shim* (correção de compatibilidade detectada em tempo de execução, sem efeito nas versões do pandas que não necessitam dela) antes de importar `pandas_datareader.data`.
-* O endpoint de raspagem de HTML do Yahoo Finance utilizado internamente pelo `get_data_yahoo` foi descontinuado e atualmente retorna erro 404 para chamadas de rede reais — uma limitação **externa** conhecida e sem correção, não sendo um bug nesta base de código. As falhas são tratadas como `DataProcessingError` com uma mensagem clara; os testes simulam (mock) a chamada de forma que permaneçam determinísticos, independentemente da disponibilidade do Yahoo. O envio de arquivo CSV continua sendo uma alternativa totalmente funcional caso o Yahoo esteja inacessível.
+* A integração com `yfinance` elimina a dependência do *shim* de compatibilidade que antes era necessário para importar `pandas-datareader` em versões recentes do pandas.
+* O download do Yahoo Finance continua sujeito a indisponibilidade de rede/API do provedor externo. As falhas são tratadas como `DataProcessingError` com mensagem clara; os testes simulam (mock) a chamada para permanecerem determinísticos, independentemente da disponibilidade do Yahoo. O envio de arquivo CSV continua sendo uma alternativa totalmente funcional caso o Yahoo esteja inacessível.
 * Os dados brutos buscados (ou enviados) são sempre salvos em `files/from-input/{ticker-or-slug}.csv`, que se torna a entrada para a etapa de ETL do PySpark.
 
 ### `app/glue_pipeline.py::transform_price_series`
