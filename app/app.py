@@ -132,7 +132,7 @@ st.caption(
 )
 
 with st.form("data_input", border=True):
-    uploaded_csv = st.file_uploader("CSV com colunas date/close (separador ';' ou ',')", type=["csv"])
+    uploaded_csv = st.file_uploader("CSV com colunas date/close (com separador ';')", type=["csv"])
 
     col1, col2, col3 = st.columns(3)
     with col1:
