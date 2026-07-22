@@ -28,7 +28,7 @@ def test_train_predict_evaluate_uses_temporal_split_and_targets_r2_band() -> Non
     assert result.metrics["iterations"] >= 1
     assert result.metrics["epochs"] >= 1
     assert len(result.past_predictions) == 16
-    assert len(result.future_predictions) == 365
+    assert len(result.future_predictions) == 16  # same as test_rows
     assert list(result.past_predictions.columns) == ["date", "close", "predicted"]
     assert list(result.future_predictions.columns) == ["date", "predicted"]
     assert result.future_predictions["date"].min() > dataframe["date"].max()

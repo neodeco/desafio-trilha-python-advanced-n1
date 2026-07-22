@@ -88,10 +88,12 @@ def _pick_column(dataframe: pd.DataFrame, candidates: tuple[str, ...], label: st
 
 
 def _normalize_dates(series: pd.Series) -> pd.Series:
-    """Convert a raw date-like series to datetime, robust to ISO and dd/mm/yyyy formats."""
+    """Convert a raw date-like series to datetime, robust to ISO and dd/mm/yyyy formats.
+
+    Dates must include year, month **and** day.  6-digit YYYYMM-only strings are
+    intentionally not padded and will be treated as unparseable (NaT).
+    """
     as_text = series.astype(str).str.strip()
-    compact_month = as_text.str.fullmatch(r"\d{6}", na=False)
-    as_text = as_text.where(~compact_month, as_text + "01")
 
     result = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
 
@@ -226,6 +228,24 @@ def process_csv_input(source: str | Path | bytes | BinaryIO | TextIO, source_nam
     raw_csv_path = _save_raw_bytes_to_from_input(content, source_name)
 
     dataframe, warnings = _read_csv_auto(content)
+
+    # File uploads must contain exactly one ticker/symbol.
+    symbol_column = _pick_column(dataframe, SYMBOL_COLUMNS, "symbol", required=False)
+    if symbol_column is not None:
+        distinct_tickers = (
+            dataframe[symbol_column]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .pipe(lambda s: s[s != ""])
+            .unique()
+        )
+        if len(distinct_tickers) > 1:
+            raise DataProcessingError(
+                f"O arquivo contem {len(distinct_tickers)} tickers diferentes "
+                f"({', '.join(sorted(distinct_tickers))}). "
+                "O arquivo deve conter apenas uma unica acao (ticker)."
+            )
 
     result = finalize_price_dataframe(dataframe, warnings)
     result.saved_path = _save_to_analysis_folder(result.dataframe, source_name)

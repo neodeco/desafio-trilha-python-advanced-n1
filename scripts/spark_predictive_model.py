@@ -74,7 +74,6 @@ def _save_forecast_cache_index(index: dict[str, dict]) -> None:
 def _build_forecast_cache_key(
     prepared_dataframe: pd.DataFrame,
     source_name: str,
-    future_days: int,
     test_fraction: float,
 ) -> str:
     ticker = str(prepared_dataframe["ticker"].mode().iloc[0]).strip().upper()
@@ -82,12 +81,18 @@ def _build_forecast_cache_key(
     max_date = prepared_dataframe["date"].max().date().isoformat()
     row_count = int(len(prepared_dataframe))
 
+    # Derive n_future from the data so the key reflects the actual future
+    # window produced (= number of test rows, computed the same way as in
+    # train_predict_evaluate).
+    split_index = max(1, min(int(row_count * (1 - test_fraction)), row_count - 1))
+    n_future = row_count - split_index
+
     hasher = hashlib.sha256()
     hasher.update(ticker.encode("utf-8"))
     hasher.update(min_date.encode("utf-8"))
     hasher.update(max_date.encode("utf-8"))
     hasher.update(str(row_count).encode("utf-8"))
-    hasher.update(str(future_days).encode("utf-8"))
+    hasher.update(str(n_future).encode("utf-8"))
     hasher.update(f"{test_fraction:.8f}".encode("utf-8"))
     hasher.update(source_name.strip().upper().encode("utf-8"))
 
@@ -379,7 +384,7 @@ def train_predict_evaluate(
             solver="l-bfgs",
         ).fit(full_v)
 
-        future_dates = pd.date_range(df["date"].max() + pd.Timedelta(days=1), periods=future_days, freq="D")
+        future_dates = pd.date_range(df["date"].max() + pd.Timedelta(days=1), periods=len(test_df), freq="D")
         future_day_index = (future_dates - first_date).days.to_numpy(dtype=float)
         future_t = future_day_index / scale
         future_pdf = pd.DataFrame({"t": future_t, "t2": future_t**2})
@@ -539,7 +544,6 @@ def run_forecast_from_csv(
     cache_key = _build_forecast_cache_key(
         prepared_dataframe=prepared_df,
         source_name=source_name,
-        future_days=future_days,
         test_fraction=test_fraction,
     )
     cached_result = _load_cached_forecast_result(cache_key)

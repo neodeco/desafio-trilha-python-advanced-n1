@@ -59,7 +59,7 @@ def test_process_csv_input_limits_period_to_last_365_days(
     assert any("365 dias" in warning for warning in result.warnings)
 
 
-def test_process_csv_input_filters_seventh_ticker_and_warns(
+def test_process_csv_input_rejects_multiple_tickers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(data_processing, "ANALYSIS_OUTPUT_DIR", tmp_path / "analysis")
@@ -72,16 +72,11 @@ def test_process_csv_input_filters_seventh_ticker_and_warns(
         trade_date = (base_date + pd.Timedelta(days=day_offset)).date()
         rows.append(f"{ticker};{trade_date};{100 + day_offset}")
 
-    result = process_csv_input("\n".join(rows).encode("utf-8"))
-
-    seventh_ticker = tickers[6]
-    assert any("setimo ticker" in warning.lower() for warning in result.warnings)
-    assert any(seventh_ticker in warning for warning in result.warnings)
-    # the seventh ticker's close value should no longer be present in the final series
-    assert (100 + 6) not in result.dataframe["close"].tolist()
+    with pytest.raises(DataProcessingError, match="unica acao"):
+        process_csv_input("\n".join(rows).encode("utf-8"))
 
 
-def test_process_csv_input_keeps_data_when_fewer_than_seven_tickers(
+def test_process_csv_input_rejects_fewer_than_seven_but_multiple_tickers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(data_processing, "ANALYSIS_OUTPUT_DIR", tmp_path / "analysis")
@@ -94,10 +89,8 @@ def test_process_csv_input_keeps_data_when_fewer_than_seven_tickers(
         "CCC;2024-01-03;12",
     ]
 
-    result = process_csv_input("\n".join(rows).encode("utf-8"))
-
-    assert len(result.dataframe) == 3
-    assert any("nao ha um setimo ticker" in warning.lower() for warning in result.warnings)
+    with pytest.raises(DataProcessingError, match="unica acao"):
+        process_csv_input("\n".join(rows).encode("utf-8"))
 
 
 def test_fetch_history_by_ticker_uses_yfinance_download_and_saves_raw_csv(
