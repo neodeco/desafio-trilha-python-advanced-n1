@@ -17,6 +17,7 @@ from scripts.csv_utils import detect_csv_separator_from_bytes, slugify  # noqa: 
 
 
 MAX_PERIOD_DAYS = 365
+SEVENTH_TICKER_POSITION = 7
 ANALYSIS_OUTPUT_DIR = Path("files/analysis")
 FROM_INPUT_DIR = Path("files/from-input")
 
@@ -89,46 +90,18 @@ def _pick_column(dataframe: pd.DataFrame, candidates: tuple[str, ...], label: st
 def _normalize_dates(series: pd.Series) -> pd.Series:
     """Convert a raw date-like series to datetime, robust to ISO and dd/mm/yyyy formats."""
     as_text = series.astype(str).str.strip()
+    compact_month = as_text.str.fullmatch(r"\d{6}", na=False)
+    as_text = as_text.where(~compact_month, as_text + "01")
 
     result = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
 
-    iso_mask = as_text.str.fullmatch(r"\d{4}-\d{2}-\d{2}", na=False)
+    iso_mask = as_text.str.match(r"^\d{4}-\d{2}-\d{2}", na=False)
     if iso_mask.any():
-        result.loc[iso_mask] = pd.to_datetime(as_text[iso_mask], format="%Y-%m-%d", errors="coerce")
+        result.loc[iso_mask] = pd.to_datetime(as_text[iso_mask], format="mixed", dayfirst=False, errors="coerce")
 
-    ymd_slash_mask = as_text.str.fullmatch(r"\d{4}/\d{2}/\d{2}", na=False)
-    if ymd_slash_mask.any():
-        result.loc[ymd_slash_mask] = pd.to_datetime(as_text[ymd_slash_mask], format="%Y/%m/%d", errors="coerce")
-
-    dmy_mask = as_text.str.fullmatch(r"\d{2}/\d{2}/\d{4}", na=False)
-    if dmy_mask.any():
-        result.loc[dmy_mask] = pd.to_datetime(as_text[dmy_mask], format="%d/%m/%Y", errors="coerce")
-
-    dmy_dash_mask = as_text.str.fullmatch(r"\d{2}-\d{2}-\d{4}", na=False)
-    if dmy_dash_mask.any():
-        result.loc[dmy_dash_mask] = pd.to_datetime(as_text[dmy_dash_mask], format="%d-%m-%Y", errors="coerce")
-
-    mdy_mask = as_text.str.fullmatch(r"\d{2}/\d{2}/\d{4}", na=False)
-    if mdy_mask.any():
-        missing = result.loc[mdy_mask].isna()
-        if missing.any():
-            candidate = as_text[mdy_mask]
-            result.loc[candidate.index[missing]] = pd.to_datetime(
-                candidate[missing], format="%m/%d/%Y", errors="coerce"
-            )
-
-    mdy_dash_mask = as_text.str.fullmatch(r"\d{2}-\d{2}-\d{4}", na=False)
-    if mdy_dash_mask.any():
-        missing = result.loc[mdy_dash_mask].isna()
-        if missing.any():
-            candidate = as_text[mdy_dash_mask]
-            result.loc[candidate.index[missing]] = pd.to_datetime(
-                candidate[missing], format="%m-%d-%Y", errors="coerce"
-            )
-
-    compact_ymd_mask = as_text.str.fullmatch(r"\d{8}", na=False)
-    if compact_ymd_mask.any():
-        result.loc[compact_ymd_mask] = pd.to_datetime(as_text[compact_ymd_mask], format="%Y%m%d", errors="coerce")
+    remaining_mask = ~iso_mask
+    if remaining_mask.any():
+        result.loc[remaining_mask] = pd.to_datetime(as_text[remaining_mask], format="mixed", dayfirst=True, errors="coerce")
 
     return result
 
@@ -143,21 +116,34 @@ def _normalize_close(series: pd.Series) -> pd.Series:
     return pd.to_numeric(cleaned, errors="coerce")
 
 
-def _validate_single_ticker(dataframe: pd.DataFrame) -> None:
-    """Enforce a single-ticker input when a ticker/symbol column is present."""
+def _filter_seventh_ticker(dataframe: pd.DataFrame, warnings: list[str]) -> pd.DataFrame:
+    """If more than one ticker is present, drop all rows for the 7th distinct ticker found."""
     symbol_column = _pick_column(dataframe, SYMBOL_COLUMNS, "symbol", required=False)
     if symbol_column is None:
-        return
+        return dataframe
 
     symbols = dataframe[symbol_column].astype(str).str.strip()
-    unique_tickers = [ticker for ticker in dict.fromkeys(symbols.tolist()) if ticker]
-    if len(unique_tickers) <= 1:
-        return
+    unique_tickers = list(dict.fromkeys(symbols.tolist()))
 
-    raise DataProcessingError(
-        f"O arquivo deve conter apenas um ticker. Foram encontrados {len(unique_tickers)} tickers distintos: "
-        + ", ".join(unique_tickers[:10])
+    if len(unique_tickers) <= 1:
+        return dataframe
+
+    if len(unique_tickers) < SEVENTH_TICKER_POSITION:
+        warnings.append(
+            f"Foram encontrados {len(unique_tickers)} tickers diferentes no arquivo. "
+            "Nenhum ticker foi removido pois nao ha um setimo ticker distinto."
+        )
+        return dataframe
+
+    seventh_ticker = unique_tickers[SEVENTH_TICKER_POSITION - 1]
+    mask = symbols == seventh_ticker
+    removed_rows = int(mask.sum())
+
+    warnings.append(
+        f"Foram encontrados {len(unique_tickers)} tickers diferentes no arquivo. "
+        f"O setimo ticker ('{seventh_ticker}') foi filtrado e {removed_rows} linha(s) removida(s)."
     )
+    return dataframe[~mask].reset_index(drop=True)
 
 
 def _save_to_analysis_folder(dataframe: pd.DataFrame, source_name: str) -> Path:
@@ -204,7 +190,8 @@ def finalize_price_dataframe(raw_df: pd.DataFrame, warnings: list[str] | None = 
 
     dataframe = raw_df.copy()
     dataframe.columns = [str(column).strip() for column in dataframe.columns]
-    _validate_single_ticker(dataframe)
+
+    dataframe = _filter_seventh_ticker(dataframe, notices)
 
     date_column = _pick_column(dataframe, DATE_COLUMNS, "Date")
     close_column = _pick_column(dataframe, CLOSE_COLUMNS, "Close")

@@ -289,7 +289,7 @@ Conforme solicitado, o histórico do ticker é buscado com `yfinance.download` e
 
 ### `app/glue_pipeline.py::transform_price_series`
 
-Uma nova transformação PySpark-SQL normaliza qualquer CSV bruto de preço (download de ticker ou upload) para apenas `date`/`close`, replicando as regras de negócio que antes ficavam no pandas (`scripts/data_processing.py::finalize_price_dataframe`): detecta colunas de data/fechamento/símbolo sem distinção de maiúsculas/minúsculas, exige ticker único quando a coluna de símbolo/ticker existe, aceita apenas datas completas (ano+mês+dia) em formatos suportados e preços com vírgula decimal via `try_to_date`/`try_cast` (necessário pois o modo ANSI do Spark 4.x lança exceção em vez de retornar nulo em `to_date`), remove duplicatas por data mantendo a última ocorrência e limita a série temporal aos últimos 365 dias. Coberto por `tests/test_glue_pipeline.py`.
+Uma nova transformação PySpark-SQL normaliza qualquer CSV bruto de preço (download de ticker ou upload) para apenas `date`/`close`, replicando as regras de negócio que antes ficavam no pandas (`scripts/data_processing.py::finalize_price_dataframe`): detecta colunas de data/fechamento/símbolo sem distinção de maiúsculas/minúsculas, descarta o 7º ticker distinto emitindo um aviso caso múltiplos símbolos estejam presentes, analisa datas no formato ISO/dd-MM-aaaa/compacto-`aaaaMM` e preços com vírgula decimal via `try_to_date`/`try_cast` (necessário pois o modo ANSI do Spark 4.x lança exceção em vez de retornar nulo em `to_date`), remove duplicatas por data mantendo a última ocorrência e limita a série temporal aos últimos 365 dias. Coberto por `tests/test_glue_pipeline.py`.
 
 ### `app/glue_job.py --mode price-series`
 
@@ -299,7 +299,7 @@ O novo modo de CLI encapsula o `transform_price_series`: lê o CSV bruto (separa
 
 O arquivo `scripts/ml_model.py` foi mesclado ao `scripts/spark_predictive_model.py` e removido. O arquivo unificado agora expõe ambos os fluxos:
 
-* `--mode forecast --forecast-input <csv>`: o modelo de previsão de data/fechamento de símbolo único (antigo conteúdo do `ml_model.py`: `ForecastResult`, `ModelTrainingError`, `train_predict_evaluate`, busca de hiperparâmetros por faixa de R2, persistência de artefatos). A persistência foi estendida de modo que o `future_predictions.csv` também é gravado em `output/model-test/` e a `past_predictions` cobre todo o intervalo real da série de entrada — necessário pois o `app.py` realiza a leitura de volta do disco após a finalização do subprocesso, sem a existência de um objeto `ForecastResult` em memória compartilhado entre os limites do processo.
+* `--mode forecast --forecast-input <csv>`: o modelo de previsão de data/fechamento de símbolo único (antigo conteúdo do `ml_model.py`: `ForecastResult`, `ModelTrainingError`, `train_predict_evaluate`, busca de hiperparâmetros por faixa de R2, persistência de artefatos). A persistência foi estendida de modo que o `future_predictions.csv` agora também é gravado em `output/model-test/` (anteriormente apenas as `past_predictions`/métricas eram salvas) — necessário pois o `app.py` realiza a leitura de volta do disco após a finalização do subprocesso, sem a existência de um objeto `ForecastResult` em memória compartilhado entre os limites do processo.
 * `--mode training --training-dir ... --test-file ...`: o fluxo original de comparação multi-símbolo do COTAHIST (LinearRegression/RandomForest/GBT), sem alterações.
 
 ### `scripts/localstack_pipeline_test.py`
