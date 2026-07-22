@@ -58,15 +58,12 @@ def test_transform_price_series_normalizes_mixed_dates_decimals_and_dedup(spark)
     assert any("apenas" in warning for warning in warnings)
 
 
-def test_transform_price_series_filters_seventh_ticker(spark):
-    rows = [(f"TICK{i}", f"2024-01-{i:02d}", "100.0") for i in range(1, 9)]
+def test_transform_price_series_requires_single_ticker(spark):
+    rows = [("AAA", "2024-01-01", "100.0"), ("BBB", "2024-01-02", "101.0")]
     raw_df = spark.createDataFrame(rows, schema="symbol string, Date string, Close string")
 
-    transformed_df, warnings = transform_price_series(raw_df)
-
-    assert transformed_df.count() == 7
-    assert any("setimo ticker" in warning.lower() for warning in warnings)
-    assert any("TICK7" in warning for warning in warnings)
+    with pytest.raises(ValueError, match="apenas um ticker"):
+        transform_price_series(raw_df)
 
 
 def test_transform_price_series_trims_to_last_365_days(spark):
@@ -85,6 +82,13 @@ def test_transform_price_series_trims_to_last_365_days(spark):
 
 def test_transform_price_series_raises_when_no_valid_rows(spark):
     raw_df = spark.createDataFrame([("not-a-date", "not-a-number")], schema="Date string, Close string")
+
+    with pytest.raises(ValueError, match="Nenhuma linha valida"):
+        transform_price_series(raw_df)
+
+
+def test_transform_price_series_rejects_dates_without_day_component(spark):
+    raw_df = spark.createDataFrame([("202401", "10.0"), ("202402", "11.0")], schema="Date string, Close string")
 
     with pytest.raises(ValueError, match="Nenhuma linha valida"):
         transform_price_series(raw_df)

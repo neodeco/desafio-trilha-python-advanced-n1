@@ -175,9 +175,11 @@ def _prepare_feature_frame(dataframe: pd.DataFrame, default_ticker: str) -> tupl
         raise ModelTrainingError("Nenhuma linha valida encontrada para ticker/date/close.")
 
     distinct_tickers = list(dict.fromkeys(df["ticker"].tolist()))
-    if len(distinct_tickers) > 1:
-        primary_ticker = df["ticker"].mode().iloc[0]
-        df = df[df["ticker"] == primary_ticker].reset_index(drop=True)
+    if ticker_column is not None and len(distinct_tickers) > 1:
+        raise ModelTrainingError(
+            f"O arquivo deve conter apenas um ticker. Foram encontrados {len(distinct_tickers)} tickers distintos: "
+            + ", ".join(distinct_tickers[:10])
+        )
 
     if len(df) < 10:
         raise ModelTrainingError("Sao necessarias pelo menos 10 linhas validas para treinar o modelo.")
@@ -409,8 +411,11 @@ def train_predict_evaluate(
         calibrated_rmse = float(np.sqrt(np.mean((test_actual - calibrated_test_predicted) ** 2)))
         calibrated_mae = float(np.mean(np.abs(test_actual - calibrated_test_predicted)))
 
-        past_predictions = test_dataset[["date", "close"]].copy().reset_index(drop=True)
-        past_predictions["predicted"] = calibrated_test_predicted
+        full_predicted = np.array([row["prediction"] for row in full_model.transform(full_v).select("prediction").collect()])
+        full_predicted = np.maximum(full_predicted, 0)
+
+        past_predictions = df[["date", "close"]].copy().reset_index(drop=True)
+        past_predictions["predicted"] = full_predicted
         future_predictions = pd.DataFrame({"date": future_dates, "predicted": future_predicted})
 
         train_target_reached = bool(TARGET_R2_MIN <= calibrated_train_r2 <= TARGET_R2_MAX)

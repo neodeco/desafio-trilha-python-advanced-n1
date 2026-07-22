@@ -75,7 +75,6 @@ def transform_price_series(
     close_columns: tuple[str, ...] = DEFAULT_CLOSE_COLUMNS,
     symbol_columns: tuple[str, ...] = DEFAULT_SYMBOL_COLUMNS,
     max_period_days: int = 365,
-    seventh_ticker_position: int = 7,
     min_recommended_rows: int = 30,
 ) -> tuple[DataFrame, list[str]]:
     """Normalize an arbitrary price CSV (ticker download or user upload) into a
@@ -83,10 +82,10 @@ def transform_price_series(
 
     This mirrors the business rules that used to live in
     ``scripts/data_processing.py`` (pandas-based): auto-detects the date/close
-    columns regardless of casing/naming, drops all rows belonging to the 7th
-    distinct ticker when multiple symbols are present, normalizes ISO and
-    dd/MM/yyyy dates plus comma-decimal prices, removes null/duplicate rows and
-    limits the series to the last ``max_period_days`` days.
+    columns regardless of casing/naming, validates that a ticker/symbol column
+    (when present) contains exactly one distinct ticker, normalizes supported
+    full-date formats plus comma-decimal prices, removes null/duplicate rows
+    and limits the series to the last ``max_period_days`` days.
 
     Returns the cleaned DataFrame (columns ``date`` as ``yyyy-MM-dd`` string and
     ``close`` as double) together with a list of human-readable warnings.
@@ -121,27 +120,15 @@ def transform_price_series(
                 .collect()
             )
         ]
+        ordered_symbols = [symbol for symbol in ordered_symbols if symbol is not None and str(symbol).strip() != ""]
 
         if len(ordered_symbols) > 1:
-            if len(ordered_symbols) < seventh_ticker_position:
-                warnings.append(
-                    f"Foram encontrados {len(ordered_symbols)} tickers diferentes no arquivo. "
-                    "Nenhum ticker foi removido pois nao ha um setimo ticker distinto."
-                )
-            else:
-                seventh_ticker = ordered_symbols[seventh_ticker_position - 1]
-                removed_rows = df.filter(F.col(symbol_column) == F.lit(seventh_ticker)).count()
-                df = df.filter(
-                    F.col(symbol_column).isNull() | (F.col(symbol_column) != F.lit(seventh_ticker))
-                )
-                warnings.append(
-                    f"Foram encontrados {len(ordered_symbols)} tickers diferentes no arquivo. "
-                    f"O setimo ticker ('{seventh_ticker}') foi filtrado e {removed_rows} linha(s) removida(s)."
-                )
+            raise ValueError(
+                f"O arquivo deve conter apenas um ticker. Foram encontrados {len(ordered_symbols)} tickers distintos: "
+                + ", ".join(str(symbol) for symbol in ordered_symbols[:10])
+            )
 
     raw_date_text = F.trim(F.col(date_column).cast(StringType()))
-    compact_month = raw_date_text.rlike(r"^\d{6}$")
-    normalized_date_text = F.when(compact_month, F.concat(raw_date_text, F.lit("01"))).otherwise(raw_date_text)
 
     # `try_to_date` (instead of `to_date`) returns NULL on unparsable input
     # rather than raising, which is required for the coalesce-based fallback
@@ -149,11 +136,13 @@ def transform_price_series(
     # back to day-first formats, matching the previous pandas
     # `dayfirst=True` convention for non-ISO input.
     parsed_date = F.coalesce(
-        F.try_to_date(normalized_date_text, "yyyy-MM-dd"),
-        F.try_to_date(normalized_date_text, "yyyyMMdd"),
-        F.try_to_date(normalized_date_text, "dd/MM/yyyy"),
-        F.try_to_date(normalized_date_text, "MM/dd/yyyy"),
-        F.try_to_date(normalized_date_text, "yyyy/MM/dd"),
+        F.try_to_date(raw_date_text, "yyyy-MM-dd"),
+        F.try_to_date(raw_date_text, "yyyyMMdd"),
+        F.try_to_date(raw_date_text, "dd/MM/yyyy"),
+        F.try_to_date(raw_date_text, "dd-MM-yyyy"),
+        F.try_to_date(raw_date_text, "MM/dd/yyyy"),
+        F.try_to_date(raw_date_text, "MM-dd-yyyy"),
+        F.try_to_date(raw_date_text, "yyyy/MM/dd"),
     )
 
     raw_close_text = F.trim(F.col(close_column).cast(StringType()))

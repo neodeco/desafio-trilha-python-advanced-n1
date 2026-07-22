@@ -59,29 +59,22 @@ def test_process_csv_input_limits_period_to_last_365_days(
     assert any("365 dias" in warning for warning in result.warnings)
 
 
-def test_process_csv_input_filters_seventh_ticker_and_warns(
+def test_process_csv_input_requires_single_ticker_when_symbol_column_exists(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(data_processing, "ANALYSIS_OUTPUT_DIR", tmp_path / "analysis")
     monkeypatch.setattr(data_processing, "FROM_INPUT_DIR", tmp_path / "from-input")
 
-    tickers = [f"TICK{i}" for i in range(1, 9)]
     rows = ["symbol;Date;Close"]
     base_date = pd.Timestamp("2024-01-01")
-    for day_offset, ticker in enumerate(tickers):
-        trade_date = (base_date + pd.Timedelta(days=day_offset)).date()
-        rows.append(f"{ticker};{trade_date};{100 + day_offset}")
+    rows.append(f"AAA;{base_date.date()};10")
+    rows.append(f"BBB;{(base_date + pd.Timedelta(days=1)).date()};11")
 
-    result = process_csv_input("\n".join(rows).encode("utf-8"))
-
-    seventh_ticker = tickers[6]
-    assert any("setimo ticker" in warning.lower() for warning in result.warnings)
-    assert any(seventh_ticker in warning for warning in result.warnings)
-    # the seventh ticker's close value should no longer be present in the final series
-    assert (100 + 6) not in result.dataframe["close"].tolist()
+    with pytest.raises(DataProcessingError, match="apenas um ticker"):
+        process_csv_input("\n".join(rows).encode("utf-8"))
 
 
-def test_process_csv_input_keeps_data_when_fewer_than_seven_tickers(
+def test_process_csv_input_accepts_single_ticker_when_symbol_column_exists(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(data_processing, "ANALYSIS_OUTPUT_DIR", tmp_path / "analysis")
@@ -90,14 +83,30 @@ def test_process_csv_input_keeps_data_when_fewer_than_seven_tickers(
     rows = [
         "symbol;Date;Close",
         "AAA;2024-01-01;10",
-        "BBB;2024-01-02;11",
-        "CCC;2024-01-03;12",
+        "AAA;2024-01-02;11",
+        "AAA;2024-01-03;12",
     ]
 
     result = process_csv_input("\n".join(rows).encode("utf-8"))
 
     assert len(result.dataframe) == 3
-    assert any("nao ha um setimo ticker" in warning.lower() for warning in result.warnings)
+    assert result.dataframe["close"].tolist() == [10.0, 11.0, 12.0]
+
+
+def test_process_csv_input_rejects_dates_without_day_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(data_processing, "ANALYSIS_OUTPUT_DIR", tmp_path / "analysis")
+    monkeypatch.setattr(data_processing, "FROM_INPUT_DIR", tmp_path / "from-input")
+
+    rows = [
+        "Date;Close",
+        "202401;10",
+        "202402;11",
+    ]
+
+    with pytest.raises(DataProcessingError, match="Nenhuma linha valida"):
+        process_csv_input("\n".join(rows).encode("utf-8"))
 
 
 def test_fetch_history_by_ticker_uses_yfinance_download_and_saves_raw_csv(

@@ -27,10 +27,12 @@ def test_train_predict_evaluate_uses_temporal_split_and_targets_r2_band() -> Non
     assert result.metrics["test_rows"] == 16
     assert result.metrics["iterations"] >= 1
     assert result.metrics["epochs"] >= 1
-    assert len(result.past_predictions) == 16
+    assert len(result.past_predictions) == 80
     assert len(result.future_predictions) == 365
     assert list(result.past_predictions.columns) == ["date", "close", "predicted"]
     assert list(result.future_predictions.columns) == ["date", "predicted"]
+    assert result.past_predictions["date"].min() == dataframe["date"].min()
+    assert result.past_predictions["date"].max() == dataframe["date"].max()
     assert result.future_predictions["date"].min() > dataframe["date"].max()
 
     assert list(pd.read_parquet(result.artifacts["train_parquet"]).columns) == ["ticker", "date", "close"]
