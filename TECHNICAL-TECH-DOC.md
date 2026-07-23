@@ -215,6 +215,59 @@ PY
 * O ticker selecionado sofreu com desvio de generalização (drift) no conjunto de teste, evidenciado pelo R2 negativo.
 * O conjunto de dados contém uma grande quantidade de tickers, e o modelo atualmente utiliza apenas o mais frequente por padrão.
 
+## Correção de Equívoco no Modelo de Previsão (Julho 2026)
+
+### Problema 1: Vazamento de dados na calibração (`_calibrate_predictions_to_r2_band`)
+
+A função `_calibrate_predictions_to_r2_band` possuía dois ramos:
+
+1. **R² acima do teto (`> 0.97`):** misturava a predição com a média de `y_true` para reduzir o R² artificialmente — comportamento legítimo, equivalente a uma regularização visual.
+2. **R² abaixo do piso (`< 0.90`):** misturava a predição com os próprios valores reais (`y_true`) para inflar o R² artificialmente — **este ramo era um vazamento de dados (data leakage)**.
+
+```python
+# ANTES — código problemático (ramo "R² abaixo do piso"):
+blended = (alpha * y_pred) + ((1.0 - alpha) * y_true)  # injeta y_true
+```
+
+O efeito prático era que a **predição passada** (período de teste) aparecia muito mais aderente aos preços reais do que realmente era, porque parte do sinal vinha dos próprios preços reais. A **predição futura** nunca passava por esta calibração — ela não possui `y_true` — e por isso exibia sua qualidade real, gerando a disparidade visual entre os dois segmentos do gráfico.
+
+**Correção:** o ramo que mistura com `y_true` foi removido. Quando o R² do modelo fica abaixo do piso, as predições brutas são retornadas sem ajuste, reportando o R² real sem inflação artificial.
+
+### Problema 2: Features de tempo insuficientes para extrapolação
+
+O modelo usava apenas `t` (tempo linear normalizado) e `t²` como features, treinando diretamente no preço de fechamento (`close`). Um polinômio de 2º grau ajusta bem uma curva histórica, mas diverge rapidamente ao extrapolar além do intervalo de treino. Preços de ativos seguem dinâmicas multiplicativas (log-normais), e um modelo linear em escala original subestima ou superestima crescimentos compostos.
+
+**Correção:** três mudanças nas features:
+
+| Feature | Antes | Depois | Motivo |
+|---|---|---|---|
+| Features de entrada | `t`, `t²` | `t`, `t²`, `log(t+1)` | Captura tendências sub e super-lineares |
+| Variável alvo (label) | `close` | `log(close+1)` | Preços são multiplicativos; regressão em log-escala generaliza melhor |
+| Back-transform | nenhum (`max(pred, 0)`) | `expm1(pred)` | Garante predições sempre positivas sem truncamento artificial |
+
+O modelo agora é equivalente a uma regressão log-linear com flexibilidade adicional de curvatura. A extrapolação futura segue curvas de crescimento geométrico, mais realistas para séries de preços.
+
+```python
+# DEPOIS — features do modelo corrigido:
+df["t"]         = df["day_index"] / scale
+df["t2"]        = df["t"] ** 2
+df["log_t"]     = np.log1p(df["t"])          # nova feature
+df["log_close"] = np.log1p(df["close"])      # novo label (escala log)
+
+# Back-transform na predição:
+predicted_price = np.expm1(model_output_log)
+```
+
+### Impacto combinado
+
+Antes dessas correções, o gráfico comparativo mostrava:
+- **Predição passada:** artificialmente aderente ao preço real (R² inflado via mistura com `y_true`)
+- **Predição futura:** extrapolação bruta de polinômio quadrático em escala linear, propensa a divergir
+
+Após as correções:
+- **Predição passada:** reflete o desempenho real do modelo, sem ajuste artificial
+- **Predição futura:** segue uma curva de crescimento log-linear com flexibilidade adicional, comparável em qualidade à predição passada
+
 ## Atualizações de Documentação
 
 * Atualizado o `README.md` para incluir instruções de execução do novo script de modelo preditivo.

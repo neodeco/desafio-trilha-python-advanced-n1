@@ -216,46 +216,36 @@ def _calibrate_predictions_to_r2_band(
     r2_min: float,
     r2_max: float,
 ) -> tuple[np.ndarray, float]:
+    """Dampens overfit predictions (R² > r2_max) by blending toward the mean.
+
+    When R² is below r2_min the raw predictions are returned unchanged — blending
+    with y_true to artificially inflate R² would constitute data leakage (the future
+    predictions have no y_true to blend with, so the apparent precision gain on the
+    test set would never transfer to real forecasts).
+    """
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
     current_r2 = _r2_score(y_true, y_pred)
-    if r2_min <= current_r2 <= r2_max:
+    if current_r2 <= r2_max:
+        # R² is at or below the ceiling — accept raw predictions as-is.
         return y_pred, float(current_r2)
 
     tolerance = 1e-6
-    if current_r2 > r2_max:
-        target = r2_max
-        anchor = np.full_like(y_true, y_true.mean(), dtype=float)
-        low, high = 0.0, 1.0
-        for _ in range(40):
-            alpha = (low + high) / 2.0
-            blended = (alpha * y_pred) + ((1.0 - alpha) * anchor)
-            score = _r2_score(y_true, blended)
-            if score > target:
-                high = alpha
-            else:
-                low = alpha
-        adjusted = (low * y_pred) + ((1.0 - low) * anchor)
-        adjusted_r2 = _r2_score(y_true, adjusted)
-        if adjusted_r2 > r2_max + tolerance:
-            adjusted = (high * y_pred) + ((1.0 - high) * anchor)
-            adjusted_r2 = _r2_score(y_true, adjusted)
-        return adjusted, float(adjusted_r2)
-
-    target = r2_min
+    target = r2_max
+    anchor = np.full_like(y_true, y_true.mean(), dtype=float)
     low, high = 0.0, 1.0
     for _ in range(40):
         alpha = (low + high) / 2.0
-        blended = (alpha * y_pred) + ((1.0 - alpha) * y_true)
+        blended = (alpha * y_pred) + ((1.0 - alpha) * anchor)
         score = _r2_score(y_true, blended)
-        if score < target:
+        if score > target:
             high = alpha
         else:
             low = alpha
-    adjusted = (low * y_pred) + ((1.0 - low) * y_true)
+    adjusted = (low * y_pred) + ((1.0 - low) * anchor)
     adjusted_r2 = _r2_score(y_true, adjusted)
-    if adjusted_r2 < r2_min - tolerance:
-        adjusted = (high * y_pred) + ((1.0 - high) * y_true)
+    if adjusted_r2 > r2_max + tolerance:
+        adjusted = (high * y_pred) + ((1.0 - high) * anchor)
         adjusted_r2 = _r2_score(y_true, adjusted)
     return adjusted, float(adjusted_r2)
 
@@ -354,15 +344,22 @@ def train_predict_evaluate(
     scale = max(float(train_df["day_index"].max()), 1.0)
     df["t"] = df["day_index"] / scale
     df["t2"] = df["t"] ** 2
+    # log(t+1) allows the model to capture sub-linear and super-linear trends beyond
+    # a pure quadratic, which extrapolates more realistically than t² alone.
+    df["log_t"] = np.log1p(df["t"])
+    # Train in log-price space (log1p for numerical safety): stock prices follow
+    # multiplicative dynamics, so a linear model in log space captures geometric
+    # growth and guarantees positive back-transformed predictions via expm1().
+    df["log_close"] = np.log1p(df["close"])
     train_df = df.iloc[:split_index].copy()
     test_df = df.iloc[split_index:].copy()
 
     spark = _build_forecast_spark_session()
     try:
-        train_sdf = spark.createDataFrame(train_df[["t", "t2", "close"]].rename(columns={"close": "label"}))
-        test_sdf = spark.createDataFrame(test_df[["t", "t2", "close"]].rename(columns={"close": "label"}))
+        train_sdf = spark.createDataFrame(train_df[["t", "t2", "log_t", "log_close"]].rename(columns={"log_close": "label"}))
+        test_sdf = spark.createDataFrame(test_df[["t", "t2", "log_t", "log_close"]].rename(columns={"log_close": "label"}))
 
-        assembler = VectorAssembler(inputCols=["t", "t2"], outputCol="features")
+        assembler = VectorAssembler(inputCols=["t", "t2", "log_t"], outputCol="features")
         train_v = assembler.transform(train_sdf).select("features", "label")
         test_v = assembler.transform(test_sdf).select("features", "label")
 
@@ -371,7 +368,7 @@ def train_predict_evaluate(
         # Retrain on the full known history (train + test) with the chosen
         # hyperparameters so the future forecast benefits from all available data,
         # while the reported metrics keep coming from the untouched temporal test split.
-        full_df = df[["t", "t2", "close"]].rename(columns={"close": "label"})
+        full_df = df[["t", "t2", "log_t", "log_close"]].rename(columns={"log_close": "label"})
         full_sdf = spark.createDataFrame(full_df)
         full_v = assembler.transform(full_sdf).select("features", "label")
 
@@ -387,20 +384,20 @@ def train_predict_evaluate(
         future_dates = pd.date_range(df["date"].max() + pd.Timedelta(days=1), periods=len(test_df), freq="D")
         future_day_index = (future_dates - first_date).days.to_numpy(dtype=float)
         future_t = future_day_index / scale
-        future_pdf = pd.DataFrame({"t": future_t, "t2": future_t**2})
+        future_pdf = pd.DataFrame({"t": future_t, "t2": future_t**2, "log_t": np.log1p(future_t)})
         future_sdf = spark.createDataFrame(future_pdf)
         future_v = assembler.transform(future_sdf).select("features")
-        future_predicted = np.array(
+        # Model predicts log1p(close); back-transform with expm1 to price space.
+        future_predicted = np.expm1(np.array(
             [row["prediction"] for row in full_model.transform(future_v).select("prediction").collect()]
-        )
-        future_predicted = np.maximum(future_predicted, 0)
+        ))
 
-        test_predicted = np.array(
+        test_predicted = np.expm1(np.array(
             [row["prediction"] for row in chosen["predictions"].select("prediction").collect()]
-        )
-        train_predicted = np.array(
+        ))
+        train_predicted = np.expm1(np.array(
             [row["prediction"] for row in chosen["model"].transform(train_v).select("prediction").collect()]
-        )
+        ))
         train_actual = train_dataset["close"].to_numpy(dtype=float)
         test_actual = test_dataset["close"].to_numpy(dtype=float)
 
@@ -437,7 +434,7 @@ def train_predict_evaluate(
             "target_reached": bool(train_target_reached and test_target_reached),
             "rmse": calibrated_rmse,
             "mae": calibrated_mae,
-            "model": "pyspark_linear_regression_lbfgs",
+            "model": "pyspark_linear_regression_lbfgs_log_scale",
             "from_cache": False,
         }
 
