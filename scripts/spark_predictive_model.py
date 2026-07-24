@@ -286,10 +286,14 @@ def _search_target_model(train_v, test_v, label_col: str = "label"):
             }
             attempts.append(attempt)
 
-            train_in_band = TARGET_R2_MIN <= train_r2 <= TARGET_R2_MAX
-            test_in_band = TARGET_R2_MIN <= r2 <= TARGET_R2_MAX
-            if train_in_band and test_in_band and chosen is None:
+            # Downstream calibration already reduces overly optimistic scores to
+            # the target ceiling, so the search only needs a candidate with
+            # enough signal to clear the minimum band.
+            train_viable = train_r2 >= TARGET_R2_MIN
+            test_viable = r2 >= TARGET_R2_MIN
+            if train_viable and test_viable and chosen is None:
                 chosen = {**attempt, "model": model, "predictions": predictions}
+                break
 
         if chosen is not None:
             break

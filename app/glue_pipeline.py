@@ -132,17 +132,13 @@ def transform_price_series(
     # Dates must contain year, month **and** day. 6-digit YYYYMM-only strings
     # are intentionally not padded and will produce NULL (row dropped).
 
-    # `try_to_date` (instead of `to_date`) returns NULL on unparseable input
-    # rather than raising, which is required for the coalesce-based fallback
-    # to work under Spark's ANSI mode. Try ISO first (unambiguous), then fall
-    # back to day-first formats, matching the previous pandas
-    # `dayfirst=True` convention for non-ISO input.
-    parsed_date = F.coalesce(
-        F.try_to_date(raw_date_text, "yyyy-MM-dd"),
-        F.try_to_date(raw_date_text, "yyyyMMdd"),
-        F.try_to_date(raw_date_text, "dd/MM/yyyy"),
-        F.try_to_date(raw_date_text, "MM/dd/yyyy"),
-        F.try_to_date(raw_date_text, "yyyy/MM/dd"),
+    # Guard each format with regex so invalid rows become NULL without relying
+    # on Spark-version-specific `try_*` helpers.
+    parsed_date = (
+        F.when(raw_date_text.rlike(r"^\d{4}-\d{2}-\d{2}$"), F.to_date(raw_date_text, "yyyy-MM-dd"))
+        .when(raw_date_text.rlike(r"^\d{8}$"), F.to_date(raw_date_text, "yyyyMMdd"))
+        .when(raw_date_text.rlike(r"^\d{2}/\d{2}/\d{4}$"), F.to_date(raw_date_text, "dd/MM/yyyy"))
+        .when(raw_date_text.rlike(r"^\d{4}/\d{2}/\d{2}$"), F.to_date(raw_date_text, "yyyy/MM/dd"))
     )
 
     raw_close_text = F.trim(F.col(close_column).cast(StringType()))
@@ -151,7 +147,10 @@ def transform_price_series(
         has_comma_decimal,
         F.regexp_replace(F.regexp_replace(raw_close_text, r"\.", ""), ",", "."),
     ).otherwise(raw_close_text)
-    parsed_close = cleaned_close_text.try_cast(DoubleType())
+    parsed_close = F.when(
+        cleaned_close_text.rlike(r"^[+-]?\d+(\.\d+)?$"),
+        cleaned_close_text.cast(DoubleType()),
+    ).otherwise(F.lit(None).cast(DoubleType()))
 
     normalized = (
         df.withColumn("date", parsed_date)
