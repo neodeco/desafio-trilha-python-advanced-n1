@@ -110,12 +110,12 @@ def _normalize_dates(series: pd.Series) -> pd.Series:
 
 def _normalize_close(series: pd.Series) -> pd.Series:
     if pd.api.types.is_numeric_dtype(series):
-        return pd.to_numeric(series, errors="coerce")
+        return pd.to_numeric(series, errors="coerce").round(6)
 
     values = series.astype(str).str.strip()
     has_comma_decimal = values.str.contains(",", regex=False, na=False)
     cleaned = values.where(~has_comma_decimal, values.str.replace(".", "", regex=False).str.replace(",", ".", regex=False))
-    return pd.to_numeric(cleaned, errors="coerce")
+    return pd.to_numeric(cleaned, errors="coerce").round(6)
 
 
 def _filter_seventh_ticker(dataframe: pd.DataFrame, warnings: list[str]) -> pd.DataFrame:
