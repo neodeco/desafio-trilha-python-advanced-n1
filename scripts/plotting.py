@@ -46,7 +46,7 @@ def plot_comparative_forecast(
         future["predicted"],
         color="black",
         linewidth=2,
-        label="Predicao futura (365 dias)",
+        label="Predicao futura (30 dias)",
     )
 
     ax.set_xlabel("Ano")
@@ -109,7 +109,7 @@ def build_interactive_forecast_figure(
             x=future["date"],
             y=future["predicted"],
             mode="lines",
-            name="Predicao futura (365 dias)",
+            name="Predicao futura (30 dias)",
             line={"color": "black", "width": 2},
         )
     )

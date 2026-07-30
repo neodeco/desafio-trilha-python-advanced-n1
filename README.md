@@ -1,133 +1,97 @@
-# desafio-trilha-python-advanced-n1
+# Desafio Trilha Python - ETL e Machine Learning para Previsão de Séries Temporais de Ações
 
-Este workspace contém um fluxo de trabalho de ingestão no estilo AWS Glue + previsão com ML (Machine Learning) que roda localmente usando o LocalStack (S3) e pode ser adaptado para o AWS Glue real posteriormente.
+Este repositório implementa um fluxo local de ETL e machine learning para analisar séries temporais de ações e prever o valor de fechamento futuro. A interface principal é um app Streamlit que aceita um CSV ou um ticker, processa os dados com PySpark, treina um modelo de regressão e exibe previsões para os próximos dias.
 
-## Arquitetura
+## O que o projeto faz hoje
 
-A interface do Streamlit nunca executa o PySpark em processo ativo. Todo o trabalho pesado de Spark/JVM (tratamento de ETL e treinamento do modelo) roda em subprocessos isolados invocados por `app/app.py`, que apenas lê os arquivos resultantes de volta do disco. Isso mantém a interface responsiva e evita que a JVM do Spark (que grava arquivos temporários na árvore do projeto enquanto o observador de arquivos do Streamlit monitora essa mesma árvore) colida com o estado dos widgets/formulários do Streamlit.
+1. Entrada de dados
+   - Aceita um arquivo CSV com colunas de data/fechamento ou um ticker para buscar histórico via `yfinance`.
+   - O CSV bruto é salvo em `files/from-input/` e, em seguida, tratado pelo ETL.
 
-1. **Entrada de dados** (`app/app.py` + `scripts/data_processing.py`): aceita o upload de um arquivo CSV OU um ticker + intervalo de datas (mutuamente exclusivos - o upload do CSV sempre tem precedência). O histórico do ticker é buscado via `yfinance.download`. De qualquer forma, o CSV *bruto* é salvo em `files/from-input/{ticker-or-slug}.csv` — que é a entrada para a etapa de ETL do PySpark abaixo. Uma pré-visualização rápida feita apenas com pandas (`ProcessingResult.dataframe`) é usada para avisos/retornos na interface de usuário. Na biblioteca financeira as ações brasileiras exigem o sufixo `.SA` para indicar que são listadas na B3 (antiga Bovespa).
-2. **Tratamento (PySpark ETL)** — subprocesso `python -m app.glue_job --mode price-series` (veja `app/glue_job.py` + `app/glue_pipeline.py::transform_price_series`): lê o CSV bruto, detecta automaticamente as colunas de data/fechamento/símbolo independentemente da nomenclatura/capitalização (maiúsculas e minúsculas), descarta o 7º ticker distinto quando múltiplos símbolos estão presentes, normaliza datas ISO/dd-MM-yyyy e preços com vírgula decimal, remove duplicatas por data (mantendo o último registro) e limita a série aos últimos 365 dias — tudo feito inteiramente com `pyspark.sql`. Grava o CSV tratado `date;close` em `files/from-file/{slug}.csv` (o mesmo diretório usado por `scripts/localstack_pipeline_test.py`), exporta uma cópia otimizada em Parquet para `output/processed_stock_data/{slug}.parquet` e faz o upload desse arquivo Parquet para um bucket S3 do LocalStack (`processed-data` por padrão).
-3. **Modelo de machine learning (PySpark)** — subprocesso `python -m scripts.spark_predictive_model --mode forecast` (veja `scripts/spark_predictive_model.py`): treina um modelo `LinearRegression` do PySpark MLlib com uma divisão temporal (sem embaralhamento/*shuffling*) para evitar overfitting, buscando épocas/regularização para manter o R2 (variância) entre 0,90 e 0,97. Reporta épocas/iterações, R2, RMSE e MAE; gera uma previsão passada (comparada com a divisão de teste) e uma previsão futura de 365 dias. Os artefatos de treinamento vão para `output/analysis`, as previsões de teste/futuras vão para `output/model-test`, e os arquivos Parquet de ambas as etapas vão para `output/processed_stock_data`.
-4. **Visualização** (`app/app.py` + `scripts/plotting.py`): lê os artefatos CSV/JSON produzidos pelas etapas 2 e 3 de volta para o pandas e renderiza avisos, métricas, um gráfico interativo do Plotly (para análise de economistas) e um gráfico estático comparativo. Os gráficos são salvos em `output/plots`.
+2. ETL com PySpark
+   - O job `app.glue_job --mode price-series` converte a entrada para uma série limpa `date;close`.
+   - O resultado é salvo em `files/from-file/`, exportado para Parquet em `output/processed_stock_data/` e enviado para um bucket S3 do LocalStack.
 
-> **Nota sobre o Yahoo Finance**: O download de histórico usa `yfinance.download`. Como qualquer provedor externo, chamadas reais podem falhar por indisponibilidade de rede/API mesmo com ticker válido. Isso é uma limitação externa do provedor de dados, não do código deste projeto — o app trata essa falha como um erro amigável do tipo `DataProcessingError`. Use o upload de CSV como alternativa quando o Yahoo estiver indisponível.
+3. Previsão de fechamento com ML
+   - O módulo `scripts/spark_predictive_model.py` treina um modelo de regressão do PySpark MLlib para prever o valor de fechamento.
+   - O problema não é de classificação (subiu/baixou). A ideia é estimar o preço futuro e inferir a tendência a partir da direção da série prevista.
+   - A modelagem usa uma divisão temporal sem shuffle, features `t`, `t²` e `log(t+1)` e alvos em escala log (`log(close+1)`), o que melhora a extrapolação para séries financeiras.
 
-## O que está incluso
+4. Visualização
+   - O app gera gráficos interativos e comparativos para mostrar os preços reais, as previsões do período de teste e a projeção futura.
 
-- Um job de transformação PySpark em `app/glue_pipeline.py` (legado multi-símbolo OHLCV + `transform_price_series` para séries de data/fechamento de símbolo único)
-- Dois pontos de entrada (entrypoints) de ETL executáveis em `app/glue_job.py` (legado `--mode stock`, novo `--mode price-series`)
-- Uma CLI integrada de treinamento/previsão em `scripts/spark_predictive_model.py` (legado `--mode training`, novo `--mode forecast`)
-- Um script de inicialização (*bootstrap*) do LocalStack em `scripts/setup_localstack.py`
-- Um teste de pipeline de ponta a ponta (*end-to-end*) do LocalStack em `scripts/localstack_pipeline_test.py`
-- Testes de regressão em `tests/`
+> Observação importante sobre o ML: as métricas atuais do projeto são métricas de regressão, não de classificação. As principais métricas exportadas são `train_r2`, `test_r2`, `rmse`, `mae` e um indicador booleano `target_reached`.
 
-## Instalação das dependências
+## Métricas de aprendizado de máquina
+
+O modelo reporta, para cada execução:
+
+- `train_r2`: desempenho no conjunto de treino.
+- `test_r2`: desempenho na parte de teste preservada temporalmente.
+- `rmse`: erro quadrático médio da previsão.
+- `mae`: erro absoluto médio.
+- `target_reached`: indica se o modelo ficou dentro da faixa alvo de R² esperada, atualmente definida entre `0.55` e `0.97`.
+
+Em execuções recentes, os valores observados podem ficar longe dessa faixa. Por exemplo, um run recente para `AAPL` registrou:
+
+- `train_r2 = 0.3938`
+- `test_r2 = -3.1534`
+- `rmse = 26.7115`
+- `mae = 24.1953`
+- `target_reached = false`
+
+Esse resultado mostra que a previsão atual ainda está limitada para esse conjunto de dados e que a tendência deve ser interpretada com cautela.
+
+## Estrutura principal
+
+- `app/app.py`: interface Streamlit e orquestração do fluxo.
+- `app/glue_job.py`: ponto de entrada do ETL PySpark.
+- `app/glue_pipeline.py`: lógica de tratamento dos dados.
+- `scripts/spark_predictive_model.py`: treinamento, avaliação e geração de previsões.
+- `scripts/plotting.py`: criação de gráficos comparativos e interativos.
+- `output/analysis/`: métricas de treino e arquivos de busca de hiperparâmetros.
+- `output/model-test/`: previsões de teste e futuras.
+- `output/plots/`: gráficos exportados.
+
+## Instalação
 
 ```bash
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-
 ```
 
-## Executar o app do Streamlit
+## Executar o app
 
 ```bash
 streamlit run app/app.py
-
 ```
 
-## Executar a transformação de ETL (PySpark) localmente
+## Executar o ETL localmente
 
 ```bash
-# Windows PowerShell
 .venv\Scripts\Activate.ps1
-
-# Ticker/CSV -> CSV de data/fechamento + Parquet + upload para o S3 do LocalStack
 python -m app.glue_job --mode price-series --input files/from-input/AAPL.csv --source-name AAPL
-
-# Transformação legada multi-símbolo OHLCV (conjunto de treino estilo COTAHIST)
-python -m app.glue_job --mode stock --input files/training-set/sample.csv --output output/processed_stock_data.parquet
-
 ```
 
 ## Executar o modelo preditivo localmente
 
 ```bash
-# Ative o ambiente virtual do repositório primeiro
 .venv\Scripts\Activate.ps1
-
-# Previsão de símbolo único de data/fechamento (usado pelo app.py e pelo teste de pipeline do LocalStack)
 python -m scripts.spark_predictive_model --mode forecast --forecast-input files/from-file/AAPL.csv --source-name AAPL
-
-# Fluxo legado multi-símbolo de conjunto de treino COTAHIST
-python -m scripts.spark_predictive_model --mode training --training-dir files/training-set --test-file files/test-set/COTAHIST_A2020.TXT --output-dir output/model
-
 ```
 
-## Automação e Monitoramento (Glue)
+## Artefatos gerados
 
-São fornecidos scripts para criar jobs/triggers do Glue (funciona com AWS real ou LocalStack) e para monitorar as execuções dos jobs.
+- `files/from-file/{slug}.csv`: série tratada `date;close`.
+- `output/processed_stock_data/{slug}.parquet`: cópia parquet do dado tratado.
+- `output/analysis/{slug}_training_metrics_*.json`: métricas do modelo.
+- `output/model-test/{slug}_test_predictions_*.csv`: previsões no período de teste.
+- `output/model-test/{slug}_future_predictions_*.csv`: projeção futura.
+- `output/plots/`: gráficos exportados.
 
-Criar um job (exemplo):
+## Observações
 
-```bash
-python scripts/glue_automation.py --create-job --job-name glue-etl-job --script-location s3://meu-bucket/scripts/glue_job.py
-
-```
-
-Criar um gatilho (*trigger*) agendado (exemplo com cron):
-
-```bash
-python scripts/glue_automation.py --create-trigger --trigger-name daily-trigger --job-name glue-etl-job --cron 'cron(0 2 * * ? *)'
-
-```
-
-Monitorar execuções:
-
-```bash
-python scripts/monitor_glue_jobs.py --job-name glue-etl-job --interval 30
-
-```
-
-## Gráfico comparativo de séries temporais
-
-Gerar um gráfico comparativo de preço + volume para `PETR4T`:
-
-```bash
-python scripts/comparative_series.py --symbol PETR4T --input-dir files/training-set --output-dir output/plots
-
-```
-
-## Executar a inicialização (bootstrap) do LocalStack
-
-```bash
-source .venv/Scripts/activate
-python scripts/setup_localstack.py
-
-```
-
-## Executar o teste de pipeline de ponta a ponta do LocalStack
-
-Executa o fluxo completo contra um container ativo do LocalStack: ETL (`app.glue_job --mode price-series`) -> verificação do upload no S3 -> modelo de previsão (`scripts.spark_predictive_model --mode forecast`) -> verificação de artefatos. Detecta automaticamente um CSV em `files/from-input/` (gerado por uma busca real de ticker ou upload de CSV) ou sintetiza uma amostra determinística para que o teste nunca dependa de acesso à rede.
-
-```bash
-source .venv/Scripts/activate
-python scripts/localstack_pipeline_test.py --endpoint-url http://localhost:4566
-
-```
-
-## Executar os testes
-
-```bash
-source .venv/Scripts/activate
-python -m pytest -q
-
-```
-
-## Notas
-
-* Os jobs de ETL lidam com valores nulos, convertem tipos de colunas numéricas, normalizam datas e calculam uma coluna de variação percentual diária (modo legado OHLCV) ou uma série limpa de `date`/`close` (modo price-series).
-* A saída em Parquet é gravada localmente e enviada para um bucket S3 do LocalStack, que pode ser redirecionado para um bucket S3 real da AWS quando implantado no AWS Glue.
-* O LocalStack está configurado para S3, SQS e DynamoDB para simular um ambiente básico de plataforma de dados da AWS.
+- O fluxo foi projetado para rodar localmente com PySpark e LocalStack, mas pode ser adaptado para um ambiente AWS real.
+- Se o Yahoo Finance não estiver disponível, o app ainda aceita CSV para que o processo continue.
+- O foco atual é a previsão de valor de fechamento, e não a classificação binária de tendência.

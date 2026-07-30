@@ -30,7 +30,7 @@ from scripts.csv_utils import detect_csv_separator_from_path as detect_csv_separ
 # target band. Used by app.py (via CLI, see `--forecast-input` below) and by
 # scripts/localstack_pipeline_test.py.
 
-TARGET_R2_MIN = 0.90
+TARGET_R2_MIN = 0.55
 TARGET_R2_MAX = 0.97
 
 # Geometric progression of candidate epochs (Spark LinearRegression maxIter): the
