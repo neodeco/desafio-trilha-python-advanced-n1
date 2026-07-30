@@ -28,7 +28,8 @@ def test_train_predict_evaluate_uses_temporal_split_and_targets_r2_band() -> Non
     assert result.metrics["iterations"] >= 1
     assert result.metrics["epochs"] >= 1
     assert len(result.past_predictions) == 16
-    assert len(result.future_predictions) == 16  # same as test_rows
+    assert len(result.future_predictions) == 365
+    assert result.metrics["future_days"] == 365
     assert list(result.past_predictions.columns) == ["date", "close", "predicted"]
     assert list(result.future_predictions.columns) == ["date", "predicted"]
     assert result.future_predictions["date"].min() > dataframe["date"].max()
@@ -41,6 +42,11 @@ def test_train_predict_evaluate_uses_temporal_split_and_targets_r2_band() -> Non
     assert result.metrics["train_target_reached"] is True
     assert result.metrics["test_target_reached"] is True
     assert result.metrics["target_reached"] is True
+    assert "baseline_naive_rmse" in result.metrics
+    assert "model_beats_naive_rmse" in result.metrics
+    assert "backtest_folds" in result.metrics
+    assert "backtest_summary" in result.metrics
+    assert isinstance(result.metrics["backtest_folds"], list)
 
     for artifact_path in result.artifacts.values():
         assert Path(artifact_path).exists()
@@ -91,6 +97,7 @@ def test_build_interactive_forecast_figure_saves_html(tmp_path: Path) -> None:
     assert path.suffix == ".html"
     assert path.stat().st_size > 0
     assert len(figure.data) == 3
+    assert figure.data[2].name == "Predicao futura (365 dias)"
     assert figure.layout.xaxis.dtick == 15 * 24 * 60 * 60 * 1000
     assert "%b/%Y" in str(figure.layout.xaxis.tickformat)
 

@@ -21,6 +21,7 @@ def plot_comparative_forecast(
     output_dir: str | Path = "output/plots",
     filename_prefix: str = "forecast",
     ticker: str | None = None,
+    future_horizon_days: int | None = None,
 ):
     """Static comparative chart: red = actual data, black = 365-day future forecast,
     with the past (test-period) prediction overlaid for comparison."""
@@ -30,6 +31,9 @@ def plot_comparative_forecast(
 
     for dataframe in (actual, past, future):
         dataframe["date"] = pd.to_datetime(dataframe["date"])
+
+    horizon_days = int(future_horizon_days) if future_horizon_days is not None else int(len(future))
+    horizon_days = max(1, horizon_days)
 
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.plot(actual["date"], actual["close"], color="red", linewidth=2, label="Dados reais")
@@ -46,7 +50,7 @@ def plot_comparative_forecast(
         future["predicted"],
         color="black",
         linewidth=2,
-        label="Predicao futura (30 dias)",
+        label=f"Predicao futura ({horizon_days} dias)",
     )
 
     ax.set_xlabel("Ano")
@@ -75,6 +79,7 @@ def build_interactive_forecast_figure(
     output_dir: str | Path = "output/plots",
     filename_prefix: str = "forecast",
     ticker: str | None = None,
+    future_horizon_days: int | None = None,
 ) -> tuple[go.Figure, Path]:
     """Interactive Plotly chart for economists to zoom/hover the final prediction:
     red = actual data, black = 365-day future forecast, dashed = past prediction."""
@@ -84,6 +89,9 @@ def build_interactive_forecast_figure(
 
     for dataframe in (actual, past, future):
         dataframe["date"] = pd.to_datetime(dataframe["date"])
+
+    horizon_days = int(future_horizon_days) if future_horizon_days is not None else int(len(future))
+    horizon_days = max(1, horizon_days)
 
     figure = go.Figure()
     figure.add_trace(
@@ -109,7 +117,7 @@ def build_interactive_forecast_figure(
             x=future["date"],
             y=future["predicted"],
             mode="lines",
-            name="Predicao futura (30 dias)",
+            name=f"Predicao futura ({horizon_days} dias)",
             line={"color": "black", "width": 2},
         )
     )

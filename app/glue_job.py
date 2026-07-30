@@ -18,12 +18,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import boto3
 from botocore.config import Config
+from py4j.protocol import Py4JJavaError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -40,7 +42,7 @@ PROCESSED_DATA_DIR = Path("output/processed_stock_data")
 
 @dataclass
 class PriceSeriesJobResult:
-    dataframe: "object"
+    rows: int
     csv_path: Path
     parquet_path: Path
     bucket: str
@@ -54,8 +56,26 @@ class PriceSeriesJobResult:
             "bucket": self.bucket,
             "key": self.key,
             "warnings": self.warnings,
-            "rows": int(len(self.dataframe)),
+            "rows": int(self.rows),
         }
+
+
+def _extract_single_part_file(temp_output_dir: Path, glob_pattern: str, target_file: Path) -> Path:
+    part_files = sorted(temp_output_dir.glob(glob_pattern))
+    if not part_files:
+        raise FileNotFoundError(f"No Spark output part file matching '{glob_pattern}' found in {temp_output_dir}")
+
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    if target_file.exists():
+        target_file.unlink()
+    shutil.move(str(part_files[0]), str(target_file))
+    shutil.rmtree(temp_output_dir, ignore_errors=True)
+    return target_file
+
+
+def _is_winutils_write_error(exc: Exception) -> bool:
+    message = str(exc)
+    return "Hadoop bin directory does not exist" in message or "winutils.exe" in message
 
 
 def upload_to_s3(local_path: Path, bucket: str, key: str, endpoint_url: str) -> None:
@@ -101,20 +121,31 @@ def run_price_series_job(
     try:
         raw_df = spark.read.option("header", True).option("sep", csv_sep).csv(str(input_path))
         transformed_df, warnings = transform_price_series(raw_df)
-
-        pandas_df = transformed_df.toPandas()
-
+        rows = transformed_df.count()
         csv_path = treated_dir / f"{slug}.csv"
-        pandas_df.to_csv(csv_path, index=False, sep=";")
-
         parquet_path = output_dir / f"{slug}.parquet"
-        pandas_df.to_parquet(parquet_path, index=False)
+        try:
+            csv_temp_dir = treated_dir / f".{slug}_csv_tmp"
+            transformed_df.coalesce(1).write.mode("overwrite").option("header", True).option("sep", ";").csv(str(csv_temp_dir))
+            _extract_single_part_file(csv_temp_dir, "part-*.csv", csv_path)
+
+            parquet_temp_dir = output_dir / f".{slug}_parquet_tmp"
+            transformed_df.coalesce(1).write.mode("overwrite").parquet(str(parquet_temp_dir))
+            _extract_single_part_file(parquet_temp_dir, "part-*.parquet", parquet_path)
+        except Py4JJavaError as exc:
+            if not _is_winutils_write_error(exc):
+                raise
+            # Windows fallback: preserve pipeline behavior when Spark local FS
+            # writes fail due missing winutils/HADOOP_HOME binaries.
+            pandas_df = transformed_df.toPandas()
+            pandas_df.to_csv(csv_path, index=False, sep=";")
+            pandas_df.to_parquet(parquet_path, index=False)
 
         key = f"{key_prefix}/{slug}.parquet"
         upload_to_s3(parquet_path, bucket, key, endpoint_url)
 
         return PriceSeriesJobResult(
-            dataframe=pandas_df,
+            rows=rows,
             csv_path=csv_path,
             parquet_path=parquet_path,
             bucket=bucket,
@@ -141,13 +172,20 @@ def run_stock_job(
         raw_df = spark.read.option("header", True).option("sep", csv_sep).csv(input_path)
         transformed_df = transform_stock_data(raw_df)
 
-        output_dir = os.path.dirname(output_path)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-
-        transformed_df.toPandas().to_parquet(output_path, index=False)
-
         output_file = Path(output_path)
+        if output_file.suffix.lower() != ".parquet":
+            output_file = output_file / "processed_stock_data.parquet"
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            parquet_temp_dir = output_file.parent / f".{output_file.stem}_tmp"
+            transformed_df.coalesce(1).write.mode("overwrite").parquet(str(parquet_temp_dir))
+            _extract_single_part_file(parquet_temp_dir, "part-*.parquet", output_file)
+        except Py4JJavaError as exc:
+            if not _is_winutils_write_error(exc):
+                raise
+            transformed_df.toPandas().to_parquet(output_file, index=False)
+
         if not output_file.exists():
             raise FileNotFoundError(f"Expected parquet output at {output_file}")
 

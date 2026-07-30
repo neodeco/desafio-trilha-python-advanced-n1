@@ -104,7 +104,7 @@ def run_forecast_model(treated_csv_path: str, source_name: str) -> dict:
     )
 
 
-def render_metrics(metrics: dict[str, float | int | str | bool]) -> None:
+def render_metrics(metrics: dict[str, object]) -> None:
     cols = st.columns(6)
     cols[0].metric("R2 treino", f"{float(metrics['train_r2']):.4f}")
     cols[1].metric("R2 teste", f"{float(metrics['test_r2']):.4f}")
@@ -122,6 +122,21 @@ def render_metrics(metrics: dict[str, float | int | str | bool]) -> None:
         f"treino {train_target_status} ({float(metrics['train_r2']):.4f}) | "
         f"teste {test_target_status} ({float(metrics['test_r2']):.4f})."
     )
+
+    baseline_rmse = metrics.get("baseline_naive_rmse")
+    backtest_summary = metrics.get("backtest_summary")
+    if baseline_rmse is not None:
+        st.caption(
+            f"Baseline ingenuo (persistencia): RMSE={float(baseline_rmse):.4f} | "
+            f"modelo melhor que baseline por RMSE: {bool(metrics.get('model_beats_naive_rmse', False))}."
+        )
+    if isinstance(backtest_summary, dict):
+        st.caption(
+            "Backtesting temporal (folds sequenciais): "
+            f"folds={int(backtest_summary.get('folds', 0))}, "
+            f"RMSE medio modelo={float(backtest_summary.get('model_rmse_mean', float('nan'))):.4f}, "
+            f"RMSE medio baseline={float(backtest_summary.get('naive_rmse_mean', float('nan'))):.4f}."
+        )
 
 
 st.title("Previsao de precos com serie temporal")

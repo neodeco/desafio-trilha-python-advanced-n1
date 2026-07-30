@@ -51,7 +51,7 @@ class ModelTrainingError(RuntimeError):
 
 @dataclass
 class ForecastResult:
-    metrics: dict[str, float | int | str | bool]
+    metrics: dict[str, object]
     past_predictions: pd.DataFrame
     future_predictions: pd.DataFrame
     artifacts: dict[str, str] = field(default_factory=dict)
@@ -75,17 +75,14 @@ def _build_forecast_cache_key(
     prepared_dataframe: pd.DataFrame,
     source_name: str,
     test_fraction: float,
+    future_days: int,
 ) -> str:
     ticker = str(prepared_dataframe["ticker"].mode().iloc[0]).strip().upper()
     min_date = prepared_dataframe["date"].min().date().isoformat()
     max_date = prepared_dataframe["date"].max().date().isoformat()
     row_count = int(len(prepared_dataframe))
 
-    # Derive n_future from the data so the key reflects the actual future
-    # window produced (= number of test rows, computed the same way as in
-    # train_predict_evaluate).
-    split_index = max(1, min(int(row_count * (1 - test_fraction)), row_count - 1))
-    n_future = row_count - split_index
+    n_future = max(1, int(future_days))
 
     hasher = hashlib.sha256()
     hasher.update(ticker.encode("utf-8"))
@@ -94,6 +91,7 @@ def _build_forecast_cache_key(
     hasher.update(str(row_count).encode("utf-8"))
     hasher.update(str(n_future).encode("utf-8"))
     hasher.update(f"{test_fraction:.8f}".encode("utf-8"))
+    hasher.update(str(int(future_days)).encode("utf-8"))
     hasher.update(source_name.strip().upper().encode("utf-8"))
 
     dates_as_int = prepared_dataframe["date"].astype("int64").to_numpy()
@@ -208,6 +206,75 @@ def _r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
         return 1.0
     numer = float(np.sum((y_true - y_pred) ** 2))
     return float(1.0 - (numer / denom))
+
+
+def _regression_summary(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+    mae = float(np.mean(np.abs(y_true - y_pred)))
+    r2 = float(_r2_score(y_true, y_pred))
+    return {"rmse": rmse, "mae": mae, "r2": r2}
+
+
+def _build_naive_predictions(train_actual: np.ndarray, test_actual: np.ndarray) -> np.ndarray:
+    baseline_start = float(train_actual[-1]) if len(train_actual) else float(test_actual[0])
+    if len(test_actual) <= 1:
+        return np.array([baseline_start], dtype=float)
+    return np.concatenate((np.array([baseline_start], dtype=float), test_actual[:-1].astype(float)))
+
+
+def _temporal_backtest(
+    dates: pd.Series,
+    actual: np.ndarray,
+    model_pred: np.ndarray,
+    naive_pred: np.ndarray,
+    n_folds: int = 3,
+) -> tuple[list[dict[str, object]], dict[str, float | int]]:
+    fold_count = max(1, min(int(n_folds), int(len(actual))))
+    fold_size = max(1, int(len(actual) // fold_count))
+
+    folds: list[dict[str, object]] = []
+    for fold_index in range(fold_count):
+        start = fold_index * fold_size
+        end = len(actual) if fold_index == fold_count - 1 else min(len(actual), (fold_index + 1) * fold_size)
+        if start >= end:
+            continue
+
+        fold_actual = actual[start:end]
+        fold_model = model_pred[start:end]
+        fold_naive = naive_pred[start:end]
+
+        model_metrics = _regression_summary(fold_actual, fold_model)
+        naive_metrics = _regression_summary(fold_actual, fold_naive)
+        folds.append(
+            {
+                "fold": fold_index + 1,
+                "start_date": pd.to_datetime(dates.iloc[start]).date().isoformat(),
+                "end_date": pd.to_datetime(dates.iloc[end - 1]).date().isoformat(),
+                "rows": int(end - start),
+                "model_rmse": model_metrics["rmse"],
+                "model_mae": model_metrics["mae"],
+                "model_r2": model_metrics["r2"],
+                "naive_rmse": naive_metrics["rmse"],
+                "naive_mae": naive_metrics["mae"],
+                "naive_r2": naive_metrics["r2"],
+                "model_beats_naive_rmse": bool(model_metrics["rmse"] < naive_metrics["rmse"]),
+            }
+        )
+
+    if not folds:
+        return [], {"folds": 0, "model_rmse_mean": float("nan"), "naive_rmse_mean": float("nan")}
+
+    model_rmse_mean = float(np.mean([float(item["model_rmse"]) for item in folds]))
+    naive_rmse_mean = float(np.mean([float(item["naive_rmse"]) for item in folds]))
+    summary = {
+        "folds": int(len(folds)),
+        "model_rmse_mean": model_rmse_mean,
+        "naive_rmse_mean": naive_rmse_mean,
+        "model_beats_naive_in_mean_rmse": bool(model_rmse_mean < naive_rmse_mean),
+    }
+    return folds, summary
 
 
 def _calibrate_predictions_to_r2_band(
@@ -333,6 +400,9 @@ def train_predict_evaluate(
     test_fraction: float = 0.2,
     source_name: str = "forecast",
 ) -> ForecastResult:
+    if int(future_days) < 1:
+        raise ModelTrainingError("future_days deve ser maior ou igual a 1.")
+
     df, first_date = _prepare_feature_frame(dataframe, default_ticker=source_name)
 
     split_index = max(1, min(int(len(df) * (1 - test_fraction)), len(df) - 1))
@@ -385,7 +455,8 @@ def train_predict_evaluate(
             solver="l-bfgs",
         ).fit(full_v)
 
-        future_dates = pd.date_range(df["date"].max() + pd.Timedelta(days=1), periods=len(test_df), freq="D")
+        n_future = max(1, int(future_days))
+        future_dates = pd.date_range(df["date"].max() + pd.Timedelta(days=1), periods=n_future, freq="D")
         future_day_index = (future_dates - first_date).days.to_numpy(dtype=float)
         future_t = future_day_index / scale
         future_pdf = pd.DataFrame({"t": future_t, "t2": future_t**2, "log_t": np.log1p(future_t)})
@@ -414,6 +485,15 @@ def train_predict_evaluate(
 
         calibrated_rmse = float(np.sqrt(np.mean((test_actual - calibrated_test_predicted) ** 2)))
         calibrated_mae = float(np.mean(np.abs(test_actual - calibrated_test_predicted)))
+        naive_test_predicted = _build_naive_predictions(train_actual, test_actual)
+        baseline_metrics = _regression_summary(test_actual, naive_test_predicted)
+        backtest_folds, backtest_summary = _temporal_backtest(
+            dates=test_dataset["date"],
+            actual=test_actual,
+            model_pred=calibrated_test_predicted,
+            naive_pred=naive_test_predicted,
+            n_folds=3,
+        )
 
         past_predictions = test_dataset[["date", "close"]].copy().reset_index(drop=True)
         past_predictions["predicted"] = calibrated_test_predicted
@@ -422,12 +502,13 @@ def train_predict_evaluate(
         train_target_reached = bool(TARGET_R2_MIN <= calibrated_train_r2 <= TARGET_R2_MAX)
         test_target_reached = bool(TARGET_R2_MIN <= calibrated_test_r2 <= TARGET_R2_MAX)
 
-        metrics: dict[str, float | int | str | bool] = {
+        metrics: dict[str, object] = {
             "iterations": len(attempts),
             "epochs": int(chosen["epochs"]),
             "reg_param": float(chosen["reg_param"]),
             "train_rows": int(len(train_df)),
             "test_rows": int(len(test_df)),
+            "future_days": int(n_future),
             "train_r2": float(calibrated_train_r2),
             "r2": float(calibrated_test_r2),
             "test_r2": float(calibrated_test_r2),
@@ -438,6 +519,12 @@ def train_predict_evaluate(
             "target_reached": bool(train_target_reached and test_target_reached),
             "rmse": calibrated_rmse,
             "mae": calibrated_mae,
+            "baseline_naive_rmse": baseline_metrics["rmse"],
+            "baseline_naive_mae": baseline_metrics["mae"],
+            "baseline_naive_r2": baseline_metrics["r2"],
+            "model_beats_naive_rmse": bool(calibrated_rmse < float(baseline_metrics["rmse"])),
+            "backtest_folds": backtest_folds,
+            "backtest_summary": backtest_summary,
             "model": "pyspark_linear_regression_lbfgs_log_scale",
             "from_cache": False,
         }
@@ -546,6 +633,7 @@ def run_forecast_from_csv(
         prepared_dataframe=prepared_df,
         source_name=source_name,
         test_fraction=test_fraction,
+        future_days=future_days,
     )
     cached_result = _load_cached_forecast_result(cache_key)
     if cached_result is not None:
