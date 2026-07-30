@@ -118,7 +118,7 @@ def render_metrics(metrics: dict[str, object]) -> None:
     st.caption(
         f"Modelo: {metrics['model']} | Split temporal (sem shuffle): "
         f"{metrics['train_rows']} treino / {metrics['test_rows']} teste | "
-        f"Faixa de R2 alvo [{metrics['target_r2_min']:.2f} - {metrics['target_r2_max']:.2f}] | "
+        f"Faixa de R2 alvo [{metrics['target_r2_min']:.2f} a {metrics['target_r2_max']:.2f}] | "
         f"treino {train_target_status} ({float(metrics['train_r2']):.4f}) | "
         f"teste {test_target_status} ({float(metrics['test_r2']):.4f})."
     )
@@ -139,9 +139,9 @@ def render_metrics(metrics: dict[str, object]) -> None:
         )
 
 
-st.title("Previsao de precos com serie temporal")
+st.title("Previsao de tendencia de acoes")
 st.caption(
-    "Envie um CSV OU informe ticker + periodo. As duas entradas sao mutuamente exclusivas. "
+    "Envie um CSV OU informe ticker + periodo. As duas entradas sao mutuamente exclusivas. | "
     "O tratamento (PySpark) e o treinamento do modelo rodam em subprocessos separados, "
     "integrados ao LocalStack (S3), para nao bloquear a interface do Streamlit."
 )

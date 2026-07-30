@@ -8,6 +8,8 @@ Aqui está a tradução técnica do documento `.md` para o português brasileiro
 
 Este repositório reúne um fluxo local de ETL e modelagem preditiva para séries temporais de ações. O objetivo atual é transformar dados brutos em uma série tratada de date/close, treinar um modelo de regressão com PySpark e gerar previsões de tendência para o fechamento futuro.
 
+O fluxo foi refinado para: escrever o ETL com Spark nativo no caminho principal, controlar o horizonte futuro com `future_days`, comparar o modelo com um baseline ingênuo de persistência e registrar backtesting temporal em folds sequenciais. No Windows, o ETL possui fallback automático para evitar falhas de gravação ligadas ao `winutils`.
+
 ## Arquitetura atual
 
 A aplicação Streamlit em app/app.py não executa PySpark diretamente. Em vez disso, ela chama subprocessos separados para:
@@ -16,6 +18,8 @@ A aplicação Streamlit em app/app.py não executa PySpark diretamente. Em vez d
 2. treinar e avaliar o modelo em scripts/spark_predictive_model.py.
 
 Essa separação evita conflitos com a JVM do Spark e mantém a interface responsiva.
+
+O app também lê de volta do disco os artefatos produzidos pelos subprocessos, incluindo métricas de treino, previsões de teste, projeções futuras e sumários de baseline/backtesting.
 
 ## Fluxo de processamento
 
@@ -38,6 +42,8 @@ O job python -m app.glue_job --mode price-series produz:
 
 O formato tratado é simples: date e close.
 
+Na implementação atual, a persistência é feita com Spark nativo no caminho principal. Quando o ambiente local do Windows não fornece suporte de Hadoop compatível, o job cai para um fallback com pandas apenas para concluir a gravação dos artefatos.
+
 ### 3. Modelo de machine learning
 
 O script scripts/spark_predictive_model.py implementa um fluxo de previsão para uma única ação. Ele:
@@ -46,7 +52,8 @@ O script scripts/spark_predictive_model.py implementa um fluxo de previsão para
 - realiza uma divisão temporal, sem shuffle;
 - cria features baseadas em tempo (t, t², log(t+1));
 - treina um LinearRegression do PySpark MLlib em escala log (log(close+1));
-- gera previsões para o período de teste e para um horizonte futuro, definido pelo número de linhas de teste ou pelo parâmetro future-days.
+- gera previsões para o período de teste e para um horizonte futuro definido por `future_days`;
+- registra baseline ingênuo de persistência e backtesting temporal em folds sequenciais.
 
 ## Natureza do problema
 
@@ -60,6 +67,12 @@ Portanto, as métricas relevantes são métricas de regressão:
 - mae
 - target_reached
 
+Métricas complementares também são exportadas para contextualizar a previsão:
+
+- baseline_naive_rmse, baseline_naive_mae, baseline_naive_r2
+- model_beats_naive_rmse
+- backtest_folds, backtest_summary
+
 ## Métricas atuais do modelo
 
 O modelo exporta os resultados em arquivos JSON em output/analysis/ e output/model-test/.
@@ -68,8 +81,8 @@ A métrica principal de qualidade é o R², mas o projeto também reporta RMSE e
 
 A faixa alvo atualmente usada é:
 
-- R² mínimo: 0.55
-- R² máximo: 0.97
+- R² mínimo: 0.60
+- R² máximo: 0.90
 
 Se o valor ficar fora dessa janela, o indicador target_reached passa a ser false.
 
@@ -93,6 +106,8 @@ A transformação PySpark-SQL em app/glue_pipeline.py normaliza qualquer CSV bru
 - converte preços com vírgula decimal para ponto decimal;
 - remove linhas inválidas e duplicatas por data, mantendo a última ocorrência;
 - limita a série ao período mais recente, com default de 365 dias (configurável em max_period_days).
+
+O ETL de stock/COTAHIST legado foi mantido para compatibilidade com os testes e usa o conversor scripts/convert_cotahist_to_csv.py, que reconstitui CSVs de séries históricas a partir do layout fixo do arquivo original.
 
 ## Artefatos produzidos
 
@@ -127,8 +142,16 @@ python -m app.glue_job --mode price-series --input files/from-input/AAPL.csv --s
 ### Modelo preditivo
 
 ```bash
-python -m scripts.spark_predictive_model --mode forecast --forecast-input files/from-file/AAPL.csv --source-name AAPL
+python -m scripts.spark_predictive_model --mode forecast --forecast-input files/from-file/AAPL.csv --source-name AAPL --future-days 30
 ```
+
+### Validação E2E LocalStack
+
+```bash
+python scripts/localstack_pipeline_test.py --endpoint-url http://localhost:4566
+```
+
+Esse teste executa o setup do LocalStack, o ETL, a verificação do upload no S3 e o forecast final, gravando um relatório em output/localstack_test_results.txt.
 
 ## Pontos de atenção
 
@@ -137,12 +160,14 @@ python -m scripts.spark_predictive_model --mode forecast --forecast-input files/
 - As métricas devem ser interpretadas como um sinal de desempenho do modelo, e não como uma garantia de precisão financeira.
 - A execução com dados reais pode ter desempenho ruim se a série for curta, ruidosa ou não estacionária.
 - O upload para o LocalStack depende de um container ativo em localhost:4566.
+- O compose foi fixado em `localstack/localstack:3.5.0` para evitar o shutdown por licença Pro na imagem mais recente.
 
 ## Próximos passos possíveis
 
 - testar outros algoritmos de regressão ou modelos baseados em séries temporais;
 - incluir validação adicional por janela temporal;
 - acrescentar métricas de direção de tendência, como acurácia de sinal, sem perder o foco principal de regressão do fechamento.
+- reduzir a dependência de fallback no Windows, se o ambiente local do Spark/Hadoop for estabilizado.
 
 ## Problema e solução de arquitetura
 
@@ -152,9 +177,11 @@ O aplicativo Streamlit apresentava o erro There are multiple identical forms wit
 
 - python -m app.glue_job --mode price-series --input <raw.csv> --source-name <slug>
 - python -m scripts.spark_predictive_model --mode forecast --forecast-input <treated.csv> --source-name <slug>
+- python scripts/localstack_pipeline_test.py --endpoint-url http://localhost:4566
 
 ## Observações adicionais
 
 - O histórico do ticker é buscado com yfinance.download.
 - O fluxo de previsão persiste artefatos de treino, previsões de teste e previsões futuras em output/analysis/ e output/model-test/.
 - O módulo scripts/csv_utils.py concentra utilidades compartilhadas para detecção de separador e geração de slug.
+- O arquivo docker/docker-compose.yml usa a imagem comunitária `localstack/localstack:3.5.0`.

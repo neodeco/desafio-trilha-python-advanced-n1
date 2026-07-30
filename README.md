@@ -2,6 +2,8 @@
 
 Este repositório implementa um fluxo local de ETL e machine learning para analisar séries temporais de ações e prever o valor de fechamento futuro. A interface principal é um app Streamlit que aceita um CSV ou um ticker, processa os dados com PySpark, treina um modelo de regressão e exibe previsões para os próximos dias.
 
+O fluxo foi ajustado para escrever os artefatos do ETL com Spark de forma nativa no caminho principal, manter o horizonte futuro configurável via `future_days`, incluir baseline ingênuo e backtesting temporal na avaliação do modelo e executar o LocalStack em imagem comunitária estável.
+
 ## O que o projeto faz hoje
 
 1. Entrada de dados
@@ -11,11 +13,14 @@ Este repositório implementa um fluxo local de ETL e machine learning para anali
 2. ETL com PySpark
    - O job app.glue_job --mode price-series converte a entrada em uma série limpa com colunas date e close.
    - O resultado é salvo em files/from-file/, exportado para Parquet em output/processed_stock_data/ e enviado para um bucket S3 do LocalStack.
+   - A escrita usa Spark nativo no caminho principal; em Windows, existe fallback automático para evitar falhas do winutils/Hadoop local.
 
 3. Previsão de fechamento com ML
    - O módulo scripts/spark_predictive_model.py treina um modelo de regressão do PySpark MLlib para prever o valor de fechamento.
    - O problema não é de classificação (subiu/baixou). A ideia é estimar o preço futuro e inferir a tendência a partir da direção da série prevista.
    - A modelagem usa uma divisão temporal sem shuffle, features t, t² e log(t+1) e alvos em escala log (log(close+1)), o que melhora a extrapolação para séries financeiras.
+   - O horizonte futuro é controlado pelo parâmetro `future_days`.
+   - A avaliação também reporta baseline ingênuo de persistência e backtesting temporal em folds sequenciais.
 
 4. Visualização
    - O app gera gráficos interativos e comparativos para mostrar os preços reais, as previsões do período de teste e a projeção futura.
@@ -34,7 +39,10 @@ As métricas atuais são de regressão, não de classificação. As principais m
 - test_r2: desempenho na parte de teste preservada temporalmente.
 - rmse: erro quadrático médio da previsão.
 - mae: erro absoluto médio.
-- target_reached: indica se o modelo ficou dentro da faixa alvo de R² esperada, atualmente definida entre 0.55 e 0.97.
+- target_reached: indica se o modelo ficou dentro da faixa alvo de R² esperada, atualmente definida entre 0.60 e 0.90.
+- baseline_naive_rmse, baseline_naive_mae, baseline_naive_r2: comparação com baseline de persistência.
+- model_beats_naive_rmse: indica se o modelo superou o baseline por RMSE.
+- backtest_folds e backtest_summary: resultado do backtesting temporal.
 
 Em execuções recentes, os valores observados podem ficar longe dessa faixa. Por exemplo, um run recente para AAPL registrou:
 
@@ -44,6 +52,8 @@ Em execuções recentes, os valores observados podem ficar longe dessa faixa. Po
 - mae = 24.1953
 - target_reached = false
 
+Em uma execução E2E recente com LocalStack e um CSV sintético, o pipeline também registrou baseline e backtesting, com o modelo ainda abaixo do baseline ingênuo em RMSE.
+
 ## Estrutura principal
 
 - app/app.py: interface Streamlit e orquestração do fluxo.
@@ -51,6 +61,7 @@ Em execuções recentes, os valores observados podem ficar longe dessa faixa. Po
 - app/glue_pipeline.py: lógica de tratamento dos dados.
 - scripts/spark_predictive_model.py: treinamento, avaliação e geração de previsões.
 - scripts/plotting.py: criação de gráficos comparativos e interativos.
+- scripts/localstack_pipeline_test.py: teste E2E do pipeline com LocalStack.
 - output/analysis/: métricas de treino e arquivos de busca de hiperparâmetros.
 - output/model-test/: previsões de teste e futuras.
 - output/plots/: gráficos exportados.
@@ -76,11 +87,13 @@ streamlit run app/app.py
 python -m app.glue_job --mode price-series --input files/from-input/AAPL.csv --source-name AAPL
 ```
 
+Se estiver no Windows e o ambiente local do Hadoop/Spark não tiver `winutils`, o job usa fallback automático para persistir os arquivos e concluir o pipeline.
+
 ## Executar o modelo preditivo localmente
 
 ```bash
 .venv\Scripts\Activate.ps1
-python -m scripts.spark_predictive_model --mode forecast --forecast-input files/from-file/AAPL.csv --source-name AAPL
+python -m scripts.spark_predictive_model --mode forecast --forecast-input files/from-file/AAPL.csv --source-name AAPL --future-days 30
 ```
 
 ## Artefatos gerados
@@ -92,9 +105,12 @@ python -m scripts.spark_predictive_model --mode forecast --forecast-input files/
 - output/model-test/{slug}_future_predictions_*.csv: projeção futura.
 - output/plots/: gráficos exportados.
 
+O forecast também grava `*_test_metrics_*.json`, `*_training_search_*.csv` e os parquets de treino/teste em `output/processed_stock_data/`.
+
 ## Observações
 
 - O fluxo foi projetado para rodar localmente com PySpark e LocalStack, mas pode ser adaptado para um ambiente AWS real.
+- O LocalStack está documentado e testado com a imagem comunitária `localstack/localstack:3.5.0`.
 - Se o Yahoo Finance não estiver disponível, o app ainda aceita CSV para que o processo continue.
 - O fluxo atual exige uma única ação por arquivo; arquivos com múltiplos tickers distintos são rejeitados na etapa de normalização.
 - O foco atual é a previsão de valor de fechamento, e não a classificação binária de tendência.

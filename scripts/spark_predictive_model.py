@@ -30,8 +30,8 @@ from scripts.csv_utils import detect_csv_separator_from_path as detect_csv_separ
 # target band. Used by app.py (via CLI, see `--forecast-input` below) and by
 # scripts/localstack_pipeline_test.py.
 
-TARGET_R2_MIN = 0.55
-TARGET_R2_MAX = 0.97
+TARGET_R2_MIN = 0.60
+TARGET_R2_MAX = 0.80
 
 # Geometric progression of candidate epochs (Spark LinearRegression maxIter): the
 # fewer epochs allowed, the less the l-bfgs optimizer converges, giving a natural,
@@ -882,7 +882,7 @@ def main():
         help="[forecast mode] Path to a treated date/close CSV (see app/glue_job.py --mode price-series)",
     )
     parser.add_argument("--source-name", default=None, help="[forecast mode] Logical name (e.g. ticker) used for output filenames")
-    parser.add_argument("--future-days", type=int, default=365, help="[forecast mode] Number of days to forecast into the future")
+    parser.add_argument("--future-days", type=int, default=30, help="[forecast mode] Number of days to forecast into the future")
     parser.add_argument("--test-fraction", type=float, default=0.2, help="[forecast mode] Fraction of rows reserved for the temporal test split")
     parser.add_argument("--sep", default="auto", help="CSV separator for input files ('auto' by default, or an explicit character)")
     args = parser.parse_args()
