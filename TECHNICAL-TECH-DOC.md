@@ -49,7 +49,7 @@ Na implementação atual, a persistência é feita com Spark nativo no caminho p
 O script scripts/spark_predictive_model.py implementa um fluxo de previsão para uma única ação. Ele:
 
 - carrega a série tratada;
-- realiza uma divisão temporal, sem shuffle;
+- realiza divisão temporal sequencial (sem shuffle) após a engenharia de features, preservando a ordem cronológica em treino/teste;
 - cria features baseadas em tempo (t, t², log(t+1));
 - treina um LinearRegression do PySpark MLlib em escala log (log(close+1));
 - gera previsões para o período de teste e para um horizonte futuro definido por `future_days`;
@@ -82,7 +82,7 @@ A métrica principal de qualidade é o R², mas o projeto também reporta RMSE e
 A faixa alvo atualmente usada é:
 
 - R² mínimo: 0.60
-- R² máximo: 0.90
+- R² máximo: 0.80
 
 Se o valor ficar fora dessa janela, o indicador target_reached passa a ser false.
 
@@ -142,7 +142,7 @@ python -m app.glue_job --mode price-series --input files/from-input/AAPL.csv --s
 ### Modelo preditivo
 
 ```bash
-python -m scripts.spark_predictive_model --mode forecast --forecast-input files/from-file/AAPL.csv --source-name AAPL --future-days 30
+python -m scripts.spark_predictive_model --mode forecast --forecast-input files/from-file/AAPL.csv --source-name AAPL --future-days 31
 ```
 
 ### Validação E2E LocalStack
@@ -183,6 +183,8 @@ O aplicativo Streamlit apresentava o erro There are multiple identical forms wit
 
 - O histórico do ticker é buscado com yfinance.download.
 - O fluxo de previsão persiste artefatos de treino, previsões de teste e previsões futuras em output/analysis/ e output/model-test/.
-- O cache de treinamento foi atualizado para manter até 7 registros recentes por ticker, com rotação automática das entradas mais antigas ao registrar um novo treino para o mesmo ticker.
+- O cache de forecast incrementa um contador de processamento sempre que um ticker é analisado.
+- O limite máximo de reprocessamentos por ticker é 7: ao atingir o limite com histórico válido, o pipeline reutiliza o cache mais recente daquele ticker.
+- O ponto de partida da projeção futura é sempre a data mais recente presente no intervalo de dados fornecido.
 - O módulo scripts/csv_utils.py concentra utilidades compartilhadas para detecção de separador e geração de slug.
 - O arquivo docker/docker-compose.yml usa a imagem comunitária `localstack/localstack:3.5.0`.

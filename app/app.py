@@ -103,13 +103,16 @@ def run_forecast_model(treated_csv_path: str, source_name: str) -> dict:
 
 
 def render_metrics(metrics: dict[str, object]) -> None:
-    cols = st.columns(6)
+    cols = st.columns(7)
     cols[0].metric("R2 treino", f"{float(metrics['train_r2']):.4f}")
     cols[1].metric("R2 teste", f"{float(metrics['test_r2']):.4f}")
     cols[2].metric("RMSE", f"{float(metrics['rmse']):.4f}")
     cols[3].metric("MAE", f"{float(metrics['mae']):.4f}")
     cols[4].metric("Iteracoes de busca", f"{int(metrics['iterations'])}")
     cols[5].metric("Epocas do modelo", f"{int(metrics['epochs'])}")
+    processing_iteration = int(metrics.get("ticker_reprocess_count", metrics.get("action_reprocess_count", 1)))
+    processing_limit = int(metrics.get("max_action_reprocessings", 7))
+    cols[6].metric("Iteracao processamento", f"{processing_iteration}/{processing_limit}")
 
     train_target_status = "atingido" if metrics["train_target_reached"] else "nao atingido"
     test_target_status = "atingido" if metrics["test_target_reached"] else "nao atingido"
@@ -243,21 +246,25 @@ render_metrics(metrics)
 if bool(metrics.get("from_cache", False)):
     st.info("Dados de ticker e periodo ja treinados anteriormente. Predicoes reaproveitadas do cache.")
 
-action_identity = "arquivo tratado" if uploaded_csv is not None else "ticker + data inicio + data fim"
+action_identity = "ticker"
 st.caption(
-    f"Identificacao da acao para cache: {action_identity}. "
-    "Cada acao permite ate 7 processamentos; apos isso, o resultado mais recente e reaproveitado do cache."
+    f"Identificacao para cache: {action_identity}. "
+    "Cada ticker permite ate 7 processamentos; apos isso, o resultado mais recente e reaproveitado do cache."
 )
 
 max_reprocessings = int(metrics.get("max_action_reprocessings", 7))
-current_reprocessings = int(metrics.get("action_reprocess_count", 1))
+current_reprocessings = int(metrics.get("ticker_reprocess_count", metrics.get("action_reprocess_count", 1)))
+total_processings = int(metrics.get("ticker_processing_count_total", current_reprocessings))
 if bool(metrics.get("cache_limit_reached", False)):
     st.warning(
-        f"Limite de {max_reprocessings} processamentos para esta acao foi atingido. "
+        f"Limite de {max_reprocessings} processamentos para este ticker foi atingido. "
         "Resultado mais recente reaproveitado do cache."
     )
 else:
-    st.caption(f"Processamento desta acao: {current_reprocessings}/{max_reprocessings}.")
+    st.caption(
+        f"Iteracao de processamento do ticker: {current_reprocessings}/{max_reprocessings} "
+        f"(total historico: {total_processings})."
+    )
 
 st.subheader(f"Predicao final para {source_label} (analise interativa para economistas)")
 st.plotly_chart(interactive_fig)

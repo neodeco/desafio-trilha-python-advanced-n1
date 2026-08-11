@@ -18,8 +18,10 @@ O fluxo foi ajustado para escrever os artefatos do ETL com Spark de forma nativa
 3. Previsão de fechamento com ML
    - O módulo scripts/spark_predictive_model.py treina um modelo de regressão do PySpark MLlib para prever o valor de fechamento.
    - O problema não é de classificação (subiu/baixou). A ideia é estimar o preço futuro e inferir a tendência a partir da direção da série prevista.
-   - A modelagem usa uma divisão temporal sem shuffle, features t, t² e log(t+1) e alvos em escala log (log(close+1)), o que melhora a extrapolação para séries financeiras.
-   - O horizonte futuro é controlado pelo parâmetro `future_days`.
+   - A modelagem usa divisão temporal sem shuffle sobre a série já com features temporais, garantindo ordem cronológica em treino e teste.
+   - As features incluem t, t², log(t+1), lags (1, 2, 3), média/volatilidade móvel e momentum curto em escala log (log(close+1)).
+   - O horizonte futuro é controlado por `future_days` com padrão de 31 dias.
+   - O ponto de partida da projeção é sempre a data mais recente presente no intervalo de dados fornecido.
    - A avaliação também reporta baseline ingênuo de persistência e backtesting temporal em folds sequenciais.
 
 4. Visualização
@@ -39,7 +41,7 @@ As métricas atuais são de regressão, não de classificação. As principais m
 - test_r2: desempenho na parte de teste preservada temporalmente.
 - rmse: erro quadrático médio da previsão.
 - mae: erro absoluto médio.
-- target_reached: indica se o modelo ficou dentro da faixa alvo de R² esperada, atualmente definida entre 0.60 e 0.90.
+- target_reached: indica se o modelo ficou dentro da faixa alvo de R² esperada, atualmente definida entre 0.60 e 0.80.
 - baseline_naive_rmse, baseline_naive_mae, baseline_naive_r2: comparação com baseline de persistência.
 - model_beats_naive_rmse: indica se o modelo superou o baseline por RMSE.
 - backtest_folds e backtest_summary: resultado do backtesting temporal.
@@ -93,7 +95,7 @@ Se estiver no Windows e o ambiente local do Hadoop/Spark não tiver `winutils`, 
 
 ```bash
 .venv\Scripts\Activate.ps1
-python -m scripts.spark_predictive_model --mode forecast --forecast-input files/from-file/AAPL.csv --source-name AAPL --future-days 30
+python -m scripts.spark_predictive_model --mode forecast --forecast-input files/from-file/AAPL.csv --source-name AAPL --future-days 31
 ```
 
 ## Artefatos gerados
@@ -105,7 +107,14 @@ python -m scripts.spark_predictive_model --mode forecast --forecast-input files/
 - output/model-test/{slug}_future_predictions_*.csv: projeção futura.
 - output/plots/: gráficos exportados.
 
-O forecast também grava `*_test_metrics_*.json`, `*_training_search_*.csv` e os parquets de treino/teste em `output/processed_stock_data/`.- O cache de treinamento agora mantém até 7 entradas recentes por ticker, descartando automaticamente as mais antigas quando um novo treino é registrado para o mesmo ticker.
+O forecast também grava `*_test_metrics_*.json`, `*_training_search_*.csv` e os parquets de treino/teste em `output/processed_stock_data/`.
+
+### Regras de cache de forecast
+
+- O cache incrementa o contador de processamento sempre que o mesmo ticker é analisado.
+- O limite máximo de reprocessamentos por ticker é 7.
+- Ao atingir esse limite com histórico válido no cache, o pipeline reutiliza o resultado mais recente para o ticker em vez de treinar novamente.
+- A rotação mantém apenas as 7 entradas mais recentes por ticker.
 ## Observações
 
 - O fluxo foi projetado para rodar localmente com PySpark e LocalStack, mas pode ser adaptado para um ambiente AWS real.
