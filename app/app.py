@@ -66,7 +66,6 @@ def load_csv_data(content: bytes, source_name: str):
     return process_csv_input(content, source_name=source_name)
 
 
-@st.cache_data(show_spinner=False, ttl="15m", max_entries=20)
 def run_price_series_etl(raw_csv_path: str, source_name: str) -> dict:
     """Treat a raw CSV via PySpark (app/glue_job.py), producing a date/close CSV
     in files/from-file/, a Parquet copy, and an upload to S3 via LocalStack."""
@@ -85,7 +84,6 @@ def run_price_series_etl(raw_csv_path: str, source_name: str) -> dict:
     )
 
 
-@st.cache_data(show_spinner=False, ttl="15m", max_entries=20)
 def run_forecast_model(treated_csv_path: str, source_name: str) -> dict:
     """Train/evaluate the PySpark forecast model (scripts/spark_predictive_model.py)
     against a treated date/close CSV."""
@@ -244,6 +242,22 @@ st.subheader("Metricas")
 render_metrics(metrics)
 if bool(metrics.get("from_cache", False)):
     st.info("Dados de ticker e periodo ja treinados anteriormente. Predicoes reaproveitadas do cache.")
+
+action_identity = "arquivo tratado" if uploaded_csv is not None else "ticker + data inicio + data fim"
+st.caption(
+    f"Identificacao da acao para cache: {action_identity}. "
+    "Cada acao permite ate 7 processamentos; apos isso, o resultado mais recente e reaproveitado do cache."
+)
+
+max_reprocessings = int(metrics.get("max_action_reprocessings", 7))
+current_reprocessings = int(metrics.get("action_reprocess_count", 1))
+if bool(metrics.get("cache_limit_reached", False)):
+    st.warning(
+        f"Limite de {max_reprocessings} processamentos para esta acao foi atingido. "
+        "Resultado mais recente reaproveitado do cache."
+    )
+else:
+    st.caption(f"Processamento desta acao: {current_reprocessings}/{max_reprocessings}.")
 
 st.subheader(f"Predicao final para {source_label} (analise interativa para economistas)")
 st.plotly_chart(interactive_fig)

@@ -105,8 +105,7 @@ python -m scripts.spark_predictive_model --mode forecast --forecast-input files/
 - output/model-test/{slug}_future_predictions_*.csv: projeção futura.
 - output/plots/: gráficos exportados.
 
-O forecast também grava `*_test_metrics_*.json`, `*_training_search_*.csv` e os parquets de treino/teste em `output/processed_stock_data/`.
-
+O forecast também grava `*_test_metrics_*.json`, `*_training_search_*.csv` e os parquets de treino/teste em `output/processed_stock_data/`.- O cache de treinamento agora mantém até 7 entradas recentes por ticker, descartando automaticamente as mais antigas quando um novo treino é registrado para o mesmo ticker.
 ## Observações
 
 - O fluxo foi projetado para rodar localmente com PySpark e LocalStack, mas pode ser adaptado para um ambiente AWS real.

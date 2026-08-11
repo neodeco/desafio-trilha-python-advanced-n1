@@ -43,6 +43,7 @@ ANALYSIS_OUTPUT_DIR = Path("output/analysis")
 MODEL_TEST_OUTPUT_DIR = Path("output/model-test")
 PROCESSED_DATA_OUTPUT_DIR = Path("output/processed_stock_data")
 FORECAST_CACHE_INDEX_PATH = ANALYSIS_OUTPUT_DIR / "forecast_cache_index.json"
+MAX_ACTION_REPROCESSINGS = 7
 
 
 class ModelTrainingError(RuntimeError):
@@ -59,11 +60,23 @@ class ForecastResult:
 
 def _load_forecast_cache_index() -> dict[str, dict]:
     if not FORECAST_CACHE_INDEX_PATH.exists():
-        return {}
+        return {"cache": {}, "ticker_history": {}, "action_history": {}}
     try:
-        return json.loads(FORECAST_CACHE_INDEX_PATH.read_text(encoding="utf-8"))
+        data = json.loads(FORECAST_CACHE_INDEX_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "cache" in data:
+            cache = data.get("cache", {})
+            ticker_history = data.get("ticker_history", {})
+            action_history = data.get("action_history", {})
+            if not isinstance(cache, dict):
+                cache = {}
+            if not isinstance(ticker_history, dict):
+                ticker_history = {}
+            if not isinstance(action_history, dict):
+                action_history = {}
+            return {"cache": cache, "ticker_history": ticker_history, "action_history": action_history}
+        return {"cache": data, "ticker_history": {}, "action_history": {}}
     except (json.JSONDecodeError, OSError):
-        return {}
+        return {"cache": {}, "ticker_history": {}, "action_history": {}}
 
 
 def _save_forecast_cache_index(index: dict[str, dict]) -> None:
@@ -71,7 +84,7 @@ def _save_forecast_cache_index(index: dict[str, dict]) -> None:
     FORECAST_CACHE_INDEX_PATH.write_text(json.dumps(index, indent=2), encoding="utf-8")
 
 
-def _build_forecast_cache_key(
+def _build_forecast_action_key(
     prepared_dataframe: pd.DataFrame,
     source_name: str,
     test_fraction: float,
@@ -96,14 +109,71 @@ def _build_forecast_cache_key(
 
     dates_as_int = prepared_dataframe["date"].astype("int64").to_numpy()
     close_values = np.round(prepared_dataframe["close"].to_numpy(dtype=float), 8)
+    high_values = np.round(prepared_dataframe["high"].to_numpy(dtype=float), 8)
+    low_values = np.round(prepared_dataframe["low"].to_numpy(dtype=float), 8)
+    volume_values = np.round(prepared_dataframe["volume"].to_numpy(dtype=float), 8)
     hasher.update(dates_as_int.tobytes())
     hasher.update(close_values.tobytes())
+    hasher.update(high_values.tobytes())
+    hasher.update(low_values.tobytes())
+    hasher.update(volume_values.tobytes())
     return hasher.hexdigest()
 
 
-def _load_cached_forecast_result(cache_key: str) -> ForecastResult | None:
-    index = _load_forecast_cache_index()
-    entry = index.get(cache_key)
+def _build_action_run_cache_key(action_key: str, run_number: int) -> str:
+    return f"{action_key}::run-{int(run_number)}"
+
+
+def _valid_cache_entry(cache: dict[str, dict], cache_key: str) -> bool:
+    entry = cache.get(cache_key)
+    if not isinstance(entry, dict):
+        return False
+
+    artifacts = entry.get("artifacts", {})
+    required_artifacts = ("training_metrics", "test_predictions", "future_predictions")
+    if not isinstance(artifacts, dict):
+        return False
+    if any(path_key not in artifacts for path_key in required_artifacts):
+        return False
+    if any(not Path(artifacts[path_key]).exists() for path_key in required_artifacts):
+        return False
+    return True
+
+
+def _clean_action_history(index: dict[str, dict], action_key: str) -> list[dict[str, object]]:
+    cache = index.setdefault("cache", {})
+    action_history = index.setdefault("action_history", {})
+    entries_raw = action_history.get(action_key, [])
+
+    cleaned: list[dict[str, object]] = []
+    if isinstance(entries_raw, list):
+        for position, item in enumerate(entries_raw, start=1):
+            cache_key = None
+            if isinstance(item, dict):
+                cache_key = item.get("cache_key")
+            elif isinstance(item, str):
+                cache_key = item
+
+            if not isinstance(cache_key, str) or not cache_key.strip():
+                continue
+            if not _valid_cache_entry(cache, cache_key):
+                continue
+
+            cleaned.append(
+                {
+                    "cache_key": cache_key,
+                    "run_number": int(item.get("run_number", position)) if isinstance(item, dict) else position,
+                    "updated_at": item.get("updated_at") if isinstance(item, dict) else None,
+                }
+            )
+
+    action_history[action_key] = cleaned[-MAX_ACTION_REPROCESSINGS:]
+    return action_history[action_key]
+
+
+def _load_cached_forecast_result(cache_key: str, index: dict[str, dict] | None = None) -> ForecastResult | None:
+    index = _load_forecast_cache_index() if index is None else index
+    entry = index.get("cache", {}).get(cache_key)
     if entry is None:
         return None
 
@@ -137,12 +207,84 @@ def _load_cached_forecast_result(cache_key: str) -> ForecastResult | None:
     return ForecastResult(metrics=metrics, past_predictions=past_predictions, future_predictions=future_predictions, artifacts=artifacts)
 
 
-def _register_forecast_cache(cache_key: str, artifacts: dict[str, str]) -> None:
+def _register_forecast_cache(
+    cache_key: str,
+    artifacts: dict[str, str],
+    source_name: str = "forecast",
+    action_key: str | None = None,
+    run_number: int | None = None,
+) -> None:
     index = _load_forecast_cache_index()
-    index[cache_key] = {
+    ticker = str(source_name).strip().upper() or "UNKNOWN"
+    now = datetime.now().isoformat(timespec="seconds")
+
+    cache_entries = index.setdefault("cache", {})
+    cache_entries[cache_key] = {
         "artifacts": artifacts,
-        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "updated_at": now,
+        "ticker": ticker,
+        "cache_key": cache_key,
+        "action_key": action_key,
+        "run_number": int(run_number) if run_number is not None else None,
     }
+
+    ticker_history = index.setdefault("ticker_history", {})
+    ticker_entries = ticker_history.setdefault(ticker, [])
+    ticker_entries = [entry for entry in ticker_entries if entry.get("cache_key") != cache_key]
+    ticker_entries.append({"cache_key": cache_key, "updated_at": now})
+    ticker_entries = ticker_entries[-MAX_ACTION_REPROCESSINGS:]
+    ticker_history[ticker] = ticker_entries
+
+    allowed_cache_keys = {entry["cache_key"] for entry in ticker_entries if entry.get("cache_key")}
+    for existing_key in list(cache_entries.keys()):
+        existing_entry = cache_entries.get(existing_key, {})
+        if existing_entry.get("ticker") == ticker and existing_key not in allowed_cache_keys:
+            del cache_entries[existing_key]
+
+    if action_key:
+        action_history = index.setdefault("action_history", {})
+        action_entries = action_history.setdefault(action_key, [])
+        action_entries = [
+            entry
+            for entry in action_entries
+            if isinstance(entry, dict) and entry.get("cache_key") != cache_key
+        ]
+        action_entries.append(
+            {
+                "cache_key": cache_key,
+                "run_number": int(run_number) if run_number is not None else len(action_entries) + 1,
+                "updated_at": now,
+            }
+        )
+        action_entries = action_entries[-MAX_ACTION_REPROCESSINGS:]
+        action_history[action_key] = action_entries
+
+        allowed_action_keys = {
+            str(entry.get("cache_key"))
+            for entry in action_entries
+            if isinstance(entry, dict) and entry.get("cache_key")
+        }
+        for existing_key in list(cache_entries.keys()):
+            existing_entry = cache_entries.get(existing_key, {})
+            if existing_entry.get("action_key") == action_key and existing_key not in allowed_action_keys:
+                del cache_entries[existing_key]
+
+        for history_key in list(action_history.keys()):
+            if history_key == action_key:
+                continue
+            history_entries = action_history.get(history_key, [])
+            if not isinstance(history_entries, list):
+                action_history[history_key] = []
+                continue
+            filtered_entries = []
+            for history_entry in history_entries:
+                if not isinstance(history_entry, dict):
+                    continue
+                history_cache_key = history_entry.get("cache_key")
+                if isinstance(history_cache_key, str) and history_cache_key in cache_entries:
+                    filtered_entries.append(history_entry)
+            action_history[history_key] = filtered_entries[-MAX_ACTION_REPROCESSINGS:]
+
     _save_forecast_cache_index(index)
 
 
@@ -163,15 +305,33 @@ def _prepare_feature_frame(dataframe: pd.DataFrame, default_ticker: str) -> tupl
     ticker_series = normalized[ticker_column].astype(str).str.strip() if ticker_column is not None else pd.Series("", index=normalized.index)
     ticker_series = ticker_series.mask(ticker_series == "", str(default_ticker).strip().upper() or "UNKNOWN")
 
+    date_series = normalized["date"] if "date" in normalized.columns else normalized["data"] if "data" in normalized.columns else None
+    if date_series is None:
+        raise ModelTrainingError("O dataframe deve conter uma coluna de data.")
+
+    close_column = "close" if "close" in normalized.columns else "fechamento" if "fechamento" in normalized.columns else None
+    high_column = "high" if "high" in normalized.columns else "máxima" if "máxima" in normalized.columns else "maxima" if "maxima" in normalized.columns else None
+    low_column = "low" if "low" in normalized.columns else "mínima" if "mínima" in normalized.columns else "minima" if "minima" in normalized.columns else None
+    volume_column = "volume" if "volume" in normalized.columns else None
+
+    if close_column is None:
+        raise ModelTrainingError("O dataframe deve conter a coluna de fechamento.")
+
     df = pd.DataFrame(
         {
             "ticker": ticker_series,
-            "date": normalized["date"],
-            "close": normalized["close"],
+            "date": date_series,
+            "close": normalized[close_column],
+            "high": normalized[high_column] if high_column is not None else pd.Series(np.nan, index=normalized.index),
+            "low": normalized[low_column] if low_column is not None else pd.Series(np.nan, index=normalized.index),
+            "volume": normalized[volume_column] if volume_column is not None else pd.Series(np.nan, index=normalized.index),
         }
     )
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df["high"] = pd.to_numeric(df["high"], errors="coerce")
+    df["low"] = pd.to_numeric(df["low"], errors="coerce")
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
     df = df.dropna(subset=["ticker", "date", "close"]).sort_values(["ticker", "date"]).reset_index(drop=True)
 
     if df.empty:
@@ -595,11 +755,21 @@ def _save_forecast_artifacts(
         encoding="utf-8",
     )
 
+    train_export = train_df[["ticker", "date", "close"]].copy()
+    train_export["low"] = train_df.get("low", pd.Series(np.nan, index=train_df.index))
+    train_export["high"] = train_df.get("high", pd.Series(np.nan, index=train_df.index))
+    train_export["volume"] = train_df.get("volume", pd.Series(np.nan, index=train_df.index))
+    train_export = train_export.rename(columns={"date": "data", "close": "fechamento", "low": "mínima", "high": "máxima"})
     train_parquet_path = PROCESSED_DATA_OUTPUT_DIR / f"{slug}_train_{timestamp}.parquet"
-    train_df[["ticker", "date", "close"]].to_parquet(train_parquet_path, index=False)
+    train_export.to_parquet(train_parquet_path, index=False)
 
+    test_export = test_df[["ticker", "date", "close"]].copy()
+    test_export["low"] = test_df.get("low", pd.Series(np.nan, index=test_df.index))
+    test_export["high"] = test_df.get("high", pd.Series(np.nan, index=test_df.index))
+    test_export["volume"] = test_df.get("volume", pd.Series(np.nan, index=test_df.index))
+    test_export = test_export.rename(columns={"date": "data", "close": "fechamento", "low": "mínima", "high": "máxima"})
     test_parquet_path = PROCESSED_DATA_OUTPUT_DIR / f"{slug}_test_{timestamp}.parquet"
-    test_df[["ticker", "date", "close"]].to_parquet(test_parquet_path, index=False)
+    test_export.to_parquet(test_parquet_path, index=False)
 
     return {
         "training_search": str(search_path),
@@ -629,24 +799,47 @@ def run_forecast_from_csv(
     dataframe.columns = [str(column).strip().lower() for column in dataframe.columns]
 
     prepared_df, _ = _prepare_feature_frame(dataframe, default_ticker=source_name)
-    cache_key = _build_forecast_cache_key(
+    action_key = _build_forecast_action_key(
         prepared_dataframe=prepared_df,
         source_name=source_name,
         test_fraction=test_fraction,
         future_days=future_days,
     )
-    cached_result = _load_cached_forecast_result(cache_key)
-    if cached_result is not None:
-        return cached_result
 
+    index = _load_forecast_cache_index()
+    action_runs = _clean_action_history(index, action_key)
+    _save_forecast_cache_index(index)
+
+    if len(action_runs) >= MAX_ACTION_REPROCESSINGS:
+        latest_cache_key = str(action_runs[-1]["cache_key"])
+        cached_result = _load_cached_forecast_result(latest_cache_key, index=index)
+        if cached_result is not None:
+            cached_result.metrics["action_key"] = action_key
+            cached_result.metrics["action_reprocess_count"] = MAX_ACTION_REPROCESSINGS
+            cached_result.metrics["max_action_reprocessings"] = MAX_ACTION_REPROCESSINGS
+            cached_result.metrics["cache_limit_reached"] = True
+            return cached_result
+
+    next_run_number = len(action_runs) + 1
+    cache_key = _build_action_run_cache_key(action_key, next_run_number)
     result = train_predict_evaluate(
         dataframe,
         future_days=future_days,
         test_fraction=test_fraction,
         source_name=source_name,
     )
-    _register_forecast_cache(cache_key, result.artifacts)
+    _register_forecast_cache(
+        cache_key,
+        result.artifacts,
+        source_name=source_name,
+        action_key=action_key,
+        run_number=next_run_number,
+    )
     result.metrics["cache_key"] = cache_key
+    result.metrics["action_key"] = action_key
+    result.metrics["action_reprocess_count"] = next_run_number
+    result.metrics["max_action_reprocessings"] = MAX_ACTION_REPROCESSINGS
+    result.metrics["cache_limit_reached"] = False
     return result
 
 

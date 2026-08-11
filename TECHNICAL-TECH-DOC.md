@@ -183,5 +183,6 @@ O aplicativo Streamlit apresentava o erro There are multiple identical forms wit
 
 - O histórico do ticker é buscado com yfinance.download.
 - O fluxo de previsão persiste artefatos de treino, previsões de teste e previsões futuras em output/analysis/ e output/model-test/.
+- O cache de treinamento foi atualizado para manter até 7 registros recentes por ticker, com rotação automática das entradas mais antigas ao registrar um novo treino para o mesmo ticker.
 - O módulo scripts/csv_utils.py concentra utilidades compartilhadas para detecção de separador e geração de slug.
 - O arquivo docker/docker-compose.yml usa a imagem comunitária `localstack/localstack:3.5.0`.
