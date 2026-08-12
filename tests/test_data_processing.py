@@ -59,7 +59,7 @@ def test_process_csv_input_limits_period_to_last_365_days(
     assert any("365 dias" in warning for warning in result.warnings)
 
 
-def test_process_csv_input_filters_seventh_ticker_and_warns(
+def test_process_csv_input_rejects_multiple_tickers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(data_processing, "ANALYSIS_OUTPUT_DIR", tmp_path / "analysis")
@@ -72,16 +72,11 @@ def test_process_csv_input_filters_seventh_ticker_and_warns(
         trade_date = (base_date + pd.Timedelta(days=day_offset)).date()
         rows.append(f"{ticker};{trade_date};{100 + day_offset}")
 
-    result = process_csv_input("\n".join(rows).encode("utf-8"))
-
-    seventh_ticker = tickers[6]
-    assert any("setimo ticker" in warning.lower() for warning in result.warnings)
-    assert any(seventh_ticker in warning for warning in result.warnings)
-    # the seventh ticker's close value should no longer be present in the final series
-    assert (100 + 6) not in result.dataframe["close"].tolist()
+    with pytest.raises(DataProcessingError, match="unica acao"):
+        process_csv_input("\n".join(rows).encode("utf-8"))
 
 
-def test_process_csv_input_keeps_data_when_fewer_than_seven_tickers(
+def test_process_csv_input_rejects_fewer_than_seven_but_multiple_tickers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(data_processing, "ANALYSIS_OUTPUT_DIR", tmp_path / "analysis")
@@ -94,31 +89,26 @@ def test_process_csv_input_keeps_data_when_fewer_than_seven_tickers(
         "CCC;2024-01-03;12",
     ]
 
-    result = process_csv_input("\n".join(rows).encode("utf-8"))
-
-    assert len(result.dataframe) == 3
-    assert any("nao ha um setimo ticker" in warning.lower() for warning in result.warnings)
+    with pytest.raises(DataProcessingError, match="unica acao"):
+        process_csv_input("\n".join(rows).encode("utf-8"))
 
 
-def test_fetch_history_by_ticker_uses_get_data_yahoo_and_saves_raw_csv(
+def test_fetch_history_by_ticker_uses_yfinance_download_and_saves_raw_csv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(data_processing, "FROM_INPUT_DIR", tmp_path / "from-input")
 
-    module = types.ModuleType("pandas_datareader")
-    data_module = types.ModuleType("pandas_datareader.data")
+    module = types.ModuleType("yfinance")
 
-    def fake_get_data_yahoo(ticker: str, start=None, end=None):
+    def fake_download(ticker: str, start=None, end=None, progress=None, auto_adjust=None):
         assert ticker == "AAPL"
         return pd.DataFrame(
             {"Close": [12.0, 11.0]},
             index=pd.to_datetime(["2024-01-02", "2024-01-01"]),
         )
 
-    data_module.get_data_yahoo = fake_get_data_yahoo
-    module.data = data_module
-    monkeypatch.setitem(sys.modules, "pandas_datareader", module)
-    monkeypatch.setitem(sys.modules, "pandas_datareader.data", data_module)
+    module.download = fake_download
+    monkeypatch.setitem(sys.modules, "yfinance", module)
 
     result = fetch_history_by_ticker("aapl", "2024-01-01", "2024-01-02")
 
@@ -139,16 +129,13 @@ def test_fetch_history_by_ticker_raises_on_empty_response(
 ) -> None:
     monkeypatch.setattr(data_processing, "FROM_INPUT_DIR", tmp_path / "from-input")
 
-    module = types.ModuleType("pandas_datareader")
-    data_module = types.ModuleType("pandas_datareader.data")
+    module = types.ModuleType("yfinance")
 
-    def fake_get_data_yahoo(ticker: str, start=None, end=None):
+    def fake_download(ticker: str, start=None, end=None, progress=None, auto_adjust=None):
         return pd.DataFrame()
 
-    data_module.get_data_yahoo = fake_get_data_yahoo
-    module.data = data_module
-    monkeypatch.setitem(sys.modules, "pandas_datareader", module)
-    monkeypatch.setitem(sys.modules, "pandas_datareader.data", data_module)
+    module.download = fake_download
+    monkeypatch.setitem(sys.modules, "yfinance", module)
 
     with pytest.raises(DataProcessingError, match="Nenhum dado retornado"):
         fetch_history_by_ticker("INVALIDX", "2024-01-01", "2024-01-02")
@@ -159,16 +146,13 @@ def test_fetch_history_by_ticker_wraps_network_errors(
 ) -> None:
     monkeypatch.setattr(data_processing, "FROM_INPUT_DIR", tmp_path / "from-input")
 
-    module = types.ModuleType("pandas_datareader")
-    data_module = types.ModuleType("pandas_datareader.data")
+    module = types.ModuleType("yfinance")
 
-    def fake_get_data_yahoo(ticker: str, start=None, end=None):
+    def fake_download(ticker: str, start=None, end=None, progress=None, auto_adjust=None):
         raise ConnectionError("network down")
 
-    data_module.get_data_yahoo = fake_get_data_yahoo
-    module.data = data_module
-    monkeypatch.setitem(sys.modules, "pandas_datareader", module)
-    monkeypatch.setitem(sys.modules, "pandas_datareader.data", data_module)
+    module.download = fake_download
+    monkeypatch.setitem(sys.modules, "yfinance", module)
 
     with pytest.raises(DataProcessingError, match="Erro de rede"):
         fetch_history_by_ticker("AAPL", "2024-01-01", "2024-01-02")

@@ -1,10 +1,10 @@
 boto3
 matplotlib
 pandas
-pandas-datareader==0.10.0
 plotly
 pyarrow
 pyspark
 pytest
 seaborn
 streamlit
+yfinance

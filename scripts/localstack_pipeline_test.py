@@ -42,9 +42,9 @@ FROM_FILE_DIR = Path("files/from-file")
 SYNTHETIC_SAMPLE_NAME = "SAMPLE_LOCALSTACK_TEST"
 
 
-def run_cmd(cmd: list[str]) -> str:
+def run_cmd(cmd: list[str], env: dict[str, str] | None = None) -> str:
     print("Running:", " ".join(cmd))
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     print(res.stdout)
     res.check_returncode()
     return res.stdout
@@ -121,7 +121,7 @@ def main() -> None:
         env["AWS_ENDPOINT_URL"] = args.endpoint_url
         env["AWS_ACCESS_KEY_ID"] = env.get("AWS_ACCESS_KEY_ID", "test")
         env["AWS_SECRET_ACCESS_KEY"] = env.get("AWS_SECRET_ACCESS_KEY", "test")
-        run_cmd([sys.executable, "scripts/setup_localstack.py"])
+        run_cmd([sys.executable, "scripts/setup_localstack.py"], env=env)
         report_lines.append("LocalStack resources ensured.")
 
         input_path = Path(args.input) if args.input else discover_or_create_sample_input()
@@ -147,7 +147,7 @@ def main() -> None:
             "--endpoint-url",
             args.endpoint_url,
         ]
-        etl_out = run_cmd(etl_cmd)
+        etl_out = run_cmd(etl_cmd, env=env)
         report_lines.append("ETL output:\n" + etl_out)
         etl_summary = parse_last_json_line(etl_out)
 
@@ -178,7 +178,7 @@ def main() -> None:
             "--source-name",
             source_name,
         ]
-        model_out = run_cmd(model_cmd)
+        model_out = run_cmd(model_cmd, env=env)
         report_lines.append("Model output:\n" + model_out)
         model_summary = parse_last_json_line(model_out)
         report_lines.append(f"Forecast metrics: {json.dumps(model_summary['metrics'], indent=2)}")

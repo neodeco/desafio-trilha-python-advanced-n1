@@ -2,313 +2,189 @@ Aqui está a tradução técnica do documento `.md` para o português brasileiro
 
 ---
 
-# Documento Técnico (Tech Doc)
+# Documento técnico do projeto
 
-## Visão Geral
+## Visão geral
 
-Este documento registra todo o histórico de desenvolvimento, etapas, avisos, erros e correções aplicadas durante o projeto, desde o início até a fase atual de modelagem preditiva.
+Este repositório reúne um fluxo local de ETL e modelagem preditiva para séries temporais de ações. O objetivo atual é transformar dados brutos em uma série tratada de date/close, treinar um modelo de regressão com PySpark e gerar previsões de tendência para o fechamento futuro.
 
-## Objetivo do Projeto
+O fluxo foi refinado para: escrever o ETL com Spark nativo no caminho principal, controlar o horizonte futuro com `future_days`, comparar o modelo com um baseline ingênuo de persistência e registrar backtesting temporal em folds sequenciais. No Windows, o ETL possui fallback automático para evitar falhas de gravação ligadas ao `winutils`.
 
-O repositório implementa um fluxo de trabalho (workflow) ETL PySpark local no estilo AWS Glue que:
+## Arquitetura atual
 
-* ingere dados de mercado de ações em formato de largura fixa a partir de arquivos `.TXT`,
-* converte-os para CSV,
-* processa e limpa os dados com Spark,
-* grava a saída em formato Parquet localmente,
-* faz o upload da saída processada para o S3 do LocalStack,
-* realiza análise exploratória,
-* e constrói um pipeline de regressão do Spark MLlib para prever os preços de fechamento do dia seguinte.
+A aplicação Streamlit em app/app.py não executa PySpark diretamente. Em vez disso, ela chama subprocessos separados para:
 
-## Configuração Inicial e Escopo
+1. tratar a entrada via ETL em app/glue_job.py;
+2. treinar e avaliar o modelo em scripts/spark_predictive_model.py.
+
+Essa separação evita conflitos com a JVM do Spark e mantém a interface responsiva.
+
+O app também lê de volta do disco os artefatos produzidos pelos subprocessos, incluindo métricas de treino, previsões de teste, projeções futuras e sumários de baseline/backtesting.
+
+## Fluxo de processamento
+
+### 1. Entrada e ingestão
+
+A aplicação aceita:
+
+- um CSV com colunas de data e fechamento; ou
+- um ticker para buscar o histórico via yfinance.
+
+Os dados brutos são salvos em files/from-input/ e servem de entrada para o ETL.
+
+### 2. ETL com PySpark
+
+O job python -m app.glue_job --mode price-series produz:
+
+- um CSV tratado em files/from-file/{slug}.csv;
+- um Parquet em output/processed_stock_data/{slug}.parquet;
+- um upload para o bucket S3 do LocalStack.
+
+O formato tratado é simples: date e close.
+
+Na implementação atual, a persistência é feita com Spark nativo no caminho principal. Quando o ambiente local do Windows não fornece suporte de Hadoop compatível, o job cai para um fallback com pandas apenas para concluir a gravação dos artefatos.
+
+### 3. Modelo de machine learning
+
+O script scripts/spark_predictive_model.py implementa um fluxo de previsão para uma única ação. Ele:
+
+- carrega a série tratada;
+- realiza divisão temporal sequencial (sem shuffle) após a engenharia de features, preservando a ordem cronológica em treino/teste;
+- cria features baseadas em tempo (t, t², log(t+1));
+- treina um LinearRegression do PySpark MLlib em escala log (log(close+1));
+- gera previsões para o período de teste e para um horizonte futuro definido por `future_days`;
+- registra baseline ingênuo de persistência e backtesting temporal em folds sequenciais.
+
+## Natureza do problema
+
+O projeto não faz classificação binária de tendência (subiu/baixou). O objetivo atual é prever o valor de fechamento futuro e, a partir disso, interpretar a tendência visualmente.
+
+Portanto, as métricas relevantes são métricas de regressão:
+
+- train_r2
+- test_r2
+- rmse
+- mae
+- target_reached
+
+Métricas complementares também são exportadas para contextualizar a previsão:
+
+- baseline_naive_rmse, baseline_naive_mae, baseline_naive_r2
+- model_beats_naive_rmse
+- backtest_folds, backtest_summary
+
+## Métricas atuais do modelo
+
+O modelo exporta os resultados em arquivos JSON em output/analysis/ e output/model-test/.
+
+A métrica principal de qualidade é o R², mas o projeto também reporta RMSE e MAE para dar contexto ao erro absoluto e ao erro quadrático.
+
+A faixa alvo atualmente usada é:
+
+- R² mínimo: 0.60
+- R² máximo: 0.80
+
+Se o valor ficar fora dessa janela, o indicador target_reached passa a ser false.
+
+### Exemplo de resultado recente
+
+Um exemplo real de execução para a ação da Apple AAPL registrou:
+
+- train_r2 = 0.3938
+- test_r2 = -3.1534
+- rmse = 26.7115
+- mae = 24.1953
+- target_reached = false
+
+## Regras de normalização implementadas
+
+A transformação PySpark-SQL em app/glue_pipeline.py normaliza qualquer CSV bruto de preço (download de ticker ou upload) para apenas date/close. As regras atuais são:
+
+- detecta colunas de data, fechamento e símbolo sem distinção de maiúsculas/minúsculas;
+- exige uma única ação por arquivo; múltiplos tickers distintos são rejeitados;
+- aceita datas em formato ISO, yyyyMMdd, dd/MM/yyyy e yyyy/MM/dd;
+- converte preços com vírgula decimal para ponto decimal;
+- remove linhas inválidas e duplicatas por data, mantendo a última ocorrência;
+- limita a série ao período mais recente, com default de 365 dias (configurável em max_period_days).
+
+O ETL de stock/COTAHIST legado foi mantido para compatibilidade com os testes e usa o conversor scripts/convert_cotahist_to_csv.py, que reconstitui CSVs de séries históricas a partir do layout fixo do arquivo original.
+
+## Artefatos produzidos
+
+- output/analysis/{slug}_training_metrics_*.json: métricas de treino.
+- output/analysis/{slug}_training_search_*.csv: tentativas de hiperparâmetros.
+- output/model-test/{slug}_test_predictions_*.csv: previsões no período de teste.
+- output/model-test/{slug}_future_predictions_*.csv: projeções futuras.
+- output/plots/: gráficos gerados para análise.
+
+## Execução local
 
 ### Ambiente
 
-* Python 3.14 via `.venv`
-* PySpark para ETL e modelagem
-* Boto3 com LocalStack para emulação local de AWS
-* Pandas/Matplotlib/Seaborn para análise
-* Fluxo de trabalho de CI do GitHub Actions parcialmente implementado
-
-#### Comandos
-
 ```bash
-cd /c/Users/andre/Projects/desafio-trilha-python-advanced-n1
-source .venv/Scripts/activate
-# ou no Windows PowerShell:
-# .venv\Scripts\Activate.ps1
-
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 ```
 
-### Arquivos Iniciais
-
-* `app/glue_pipeline.py`: lógica central de ETL do Spark
-* `app/glue_job.py`: executor de CLI e gerenciamento de saídas
-* `scripts/setup_localstack.py`: configuração de recursos do LocalStack
-* `scripts/convert_cotahist_to_csv.py`: conversor de arquivos de largura fixa
-* `scripts/exploratory_analysis.py`: workflow de análise exploratória
-* `README.md`: documentação e instruções
-* `tests/test_glue_pipeline.py`: teste unitário do ETL
-
-## Conversão de Dados e ETL
-
-### Conversor de Largura Fixa
-
-* Implementado o script `scripts/convert_cotahist_to_csv.py` para analisar os registros do COTAHIST `.TXT`.
-* O conversor utiliza um layout de registro e extrai os campos a partir de fatias (slices) fixas.
-* A normalização incluiu a limpeza de símbolos, formatação de datas, conversão de tipos numéricos e extração de volume.
-
-#### Comandos
+### App Streamlit
 
 ```bash
-# Inspecionar as pastas de conjuntos de dados de treino/teste
-cd /c/Users/andre/Projects/desafio-trilha-python-advanced-n1
-ls files/training-set && ls files/test-set
-
-# Converter um arquivo TXT para CSV usando o módulo conversor
-python scripts/convert_cotahist_to_csv.py
-# ou diretamente pelo Python usando o helper auxiliar
-python - <<'PY'
-from scripts.convert_cotahist_to_csv import convert_to_csv
-from pathlib import Path
-convert_to_csv(Path('files/test-set/COTAHIST_A2020.TXT'), Path('files/test-set/COTAHIST_A2020.csv'))
-PY
-
+streamlit run app/app.py
 ```
 
-### Principais Problemas e Correções
-
-* **Problema:** Importação do Spark `Window` ausente em `app/glue_pipeline.py`.
-* **Correção:** Importado o `Window` e utilizadas funções de janela para os cálculos de `lag`/`lead`.
-
-
-* **Problema:** O Spark no Windows exigia um caminho explícito do Hadoop / avisos de winutils.
-* **Correção:** Reconhecido o aviso local do Windows com o `HADOOP_HOME` não configurado; o workflow continua executando normalmente.
-
-
-* **Problema:** A conversão de data em alguns registros não considerava valores no formato `AAAAMM`.
-* **Correção:** Adicionada lógica para normalizar `trade_date` para `AAAAMMDD` quando necessário.
-
-
-* **Problema:** Estouro de capacidade (overflow) na conversão de volume ao usar `IntegerType`.
-* **Correção:** Alterado para `LongType` para o campo de volume.
-
-
-* **Problema:** A análise de largura fixa apresentava fatiamento de string incorreto nos campos de símbolo/moeda.
-* **Correção:** Refinada a lógica de análise do conversor e adicionado tratamento robusto em `parse_number`.
-
-
-
-## Integração com LocalStack
-
-### Script de Configuração
-
-* Disponibilizado o script `scripts/setup_localstack.py` para inicializar os recursos do LocalStack.
-* Os recursos incluíram a criação do bucket S3 e quaisquer serviços locais necessários.
-
-#### Comandos
+### ETL
 
 ```bash
-# Inicializar os recursos do LocalStack
-cd /c/Users/andre/Projects/desafio-trilha-python-advanced-n1
-python scripts/setup_localstack.py
-
+python -m app.glue_job --mode price-series --input files/from-input/AAPL.csv --source-name AAPL
 ```
 
-### Caminho de Upload para AWS
-
-* O script `app/glue_job.py` foi implementado para gravar o Parquet localmente e usar `boto3.upload_file` para enviar ao S3 do LocalStack, simulando um fluxo de plataforma de dados real.
-
-## Análise Exploratória
-
-* Implementado o script `scripts/exploratory_analysis.py` para geração de gráficos e estatísticas descritivas.
-* Utilizados pandas e seaborn/matplotlib para inspecionar os arquivos Parquet processados.
-
-#### Comandos
+### Modelo preditivo
 
 ```bash
-cd /c/Users/andre/Projects/desafio-trilha-python-advanced-n1
-python scripts/exploratory_analysis.py
-
+python -m scripts.spark_predictive_model --mode forecast --forecast-input files/from-file/AAPL.csv --source-name AAPL --future-days 31
 ```
 
-## Fase de Modelagem Preditiva
-
-### Novo Script
-
-* Adicionado o script `scripts/spark_predictive_model.py` para treinar modelos de regressão com Spark MLlib.
-* O script realiza as seguintes etapas:
-* carrega os dados de treino a partir de `files/training-set`
-* converte quaisquer arquivos `.TXT` para CSV quando necessário
-* pré-processa os dados com Spark
-* constrói vetores de características (features) a partir de `open`, `high`, `low`, `volume`, `prev_close`
-* treina modelos de Regressão Linear, Random Forest e GBT (Gradient-Boosted Trees)
-* valida em uma divisão de dados separada (hold-out split)
-* avalia o melhor modelo no arquivo `files/test-set/COTAHIST_A2020.TXT`
-* armazena os resultados em `output/model`
-
-
-
-### Inspeção de Dados
-
-* Verificado se o conteúdo do diretório de treino inclui tanto arquivos CSV quanto `.TXT`.
-* Confirmada a existência do CSV de treino existente `files/training-set/cotahist_m072025.csv`.
-* Confirmada a existência do arquivo de teste de origem `files/test-set/COTAHIST_A2020.TXT`.
-* Inspecionadas as linhas da amostra de treino e confirmadas as colunas de dados.
-
-#### Comandos
+### Validação E2E LocalStack
 
 ```bash
-cd /c/Users/andre/Projects/desafio-trilha-python-advanced-n1
-python - <<'PY'
-import pandas as pd
-from pathlib import Path
-train = pd.read_csv('files/training-set/cotahist_m072025.csv')
-print(train.head())
-print(train['symbol'].value_counts().head())
-PY
-
+python scripts/localstack_pipeline_test.py --endpoint-url http://localhost:4566
 ```
 
-### Correções no Pré-processamento
+Esse teste executa o setup do LocalStack, o ETL, a verificação do upload no S3 e o forecast final, gravando um relatório em output/localstack_test_results.txt.
 
-* Adicionado filtro robusto de linhas para remover registros com características nulas (NaN) antes da montagem de features do Spark.
-* Configurado o `VectorAssembler` com `handleInvalid="skip"`.
-* Adicionada validação de conjunto de dados de teste para lançar um erro caso nenhuma linha válida reste após a filtragem.
+## Pontos de atenção
 
-### Resultados da Execução do Modelo
+- O código atual usa uma abordagem de regressão para prever o fechamento, e não um modelo de classificação.
+- A extrapolação futura é mais sensível do que a previsão dentro do intervalo de treino.
+- As métricas devem ser interpretadas como um sinal de desempenho do modelo, e não como uma garantia de precisão financeira.
+- A execução com dados reais pode ter desempenho ruim se a série for curta, ruidosa ou não estacionária.
+- O upload para o LocalStack depende de um container ativo em localhost:4566.
+- O compose foi fixado em `localstack/localstack:3.5.0` para evitar o shutdown por licença Pro na imagem mais recente.
 
-* A execução do modelo foi concluída com sucesso nos testes locais.
-* Símbolo (ticker) selecionado para modelagem: `PETR4T`.
-* Quantidade de treino/validação: `1440` linhas de treino, `298` linhas de validação.
-* Métricas de validação:
-* `LinearRegression`: RMSE ~ 1.72e9, R2 ~ 0.162
-* `RandomForest`: RMSE ~ 1.56e9, R2 ~ 0.311
-* `GBT`: RMSE ~ 1.25e9, R2 ~ 0.554
+## Próximos passos possíveis
 
+- testar outros algoritmos de regressão ou modelos baseados em séries temporais;
+- incluir validação adicional por janela temporal;
+- acrescentar métricas de direção de tendência, como acurácia de sinal, sem perder o foco principal de regressão do fechamento.
+- reduzir a dependência de fallback no Windows, se o ambiente local do Spark/Hadoop for estabilizado.
 
-* Melhor modelo: `gbt`
-* Métricas de teste no arquivo `COTAHIST_A2020.TXT`:
-* RMSE ~ 4.86e9
-* MAE ~ 3.81e9
-* R2 ~ -1.241
+## Problema e solução de arquitetura
 
+O aplicativo Streamlit apresentava o erro There are multiple identical forms with key='data_input' quando o PySpark era executado de forma síncrona dentro do processo da interface. A solução adotada foi isolar o trabalho do Spark em subprocessos independentes, invocados a partir de app/app.py via subprocess.run. Cada subprocesso imprime um resumo JSON final em stdout, que o app lê para localizar os artefatos de saída.
 
+### Fluxos suportados
 
-#### Comandos
+- python -m app.glue_job --mode price-series --input <raw.csv> --source-name <slug>
+- python -m scripts.spark_predictive_model --mode forecast --forecast-input <treated.csv> --source-name <slug>
+- python scripts/localstack_pipeline_test.py --endpoint-url http://localhost:4566
 
-```bash
-cd /c/Users/andre/Projects/desafio-trilha-python-advanced-n1
-.venv/Scripts/python -u scripts/spark_predictive_model.py --training-dir files/training-set --test-file files/test-set/COTAHIST_A2020.TXT --output-dir output/model-test
+## Observações adicionais
 
-# Inspecionar arquivos de saída gerados
-python - <<'PY'
-from pathlib import Path
-print(list(Path('output/model-test').glob('*')))
-PY
-
-```
-
-### Avisos e Observações
-
-* Problemas do Spark no Windows com a ausência do `winutils.exe` e falha no carregamento da biblioteca nativa do Hadoop foram observados, mas não impediram a execução.
-* O ticker selecionado sofreu com desvio de generalização (drift) no conjunto de teste, evidenciado pelo R2 negativo.
-* O conjunto de dados contém uma grande quantidade de tickers, e o modelo atualmente utiliza apenas o mais frequente por padrão.
-
-## Atualizações de Documentação
-
-* Atualizado o `README.md` para incluir instruções de execução do novo script de modelo preditivo.
-
-## Arquivos Atuais Adicionados/Modificados
-
-* Adicionado: `scripts/spark_predictive_model.py`
-* Adicionado: `TECHNICAL-TECH-DOC.md`
-* Modificado: `README.md`
-* Arquivos existentes verificados: `scripts/convert_cotahist_to_csv.py`, `app/glue_pipeline.py`, `app/glue_job.py`, `scripts/setup_localstack.py`, `scripts/exploratory_analysis.py`
-
-## Como Executar de Ponta a Ponta (End-to-End)
-
-1. Ative o ambiente virtual Python.
-2. Obtenha um CSV de preços brutos: busque um ticker via `pandas_datareader.data.get_data_yahoo` (através de `app/app.py`, que o salva em `files/from-input/{ticker}.csv`) ou faça o upload de um CSV.
-3. Execute o job de ETL do PySpark: `python -m app.glue_job --mode price-series --input files/from-input/AAPL.csv --source-name AAPL`.
-Isso irá gravar `files/from-file/AAPL.csv` (`date;close`), `output/processed_stock_data/AAPL.parquet` e fazer o upload do arquivo Parquet para o bucket S3 do LocalStack chamado `processed-data`.
-4. Execute o modelo de previsão: `python -m scripts.spark_predictive_model --mode forecast --forecast-input files/from-file/AAPL.csv --source-name AAPL`.
-5. Inspecione os resultados em `output/analysis/` (busca/métricas de treino) e `output/model-test/` (métricas e previsões futuras/de teste).
-6. (Opcional) execute o fluxo legado multi-símbolo do COTAHIST:
-`python -m scripts.spark_predictive_model --mode training --training-dir files/training-set --test-file files/test-set/COTAHIST_A2020.TXT --output-dir output/model`
-e inspecione `output/model/training_results.csv` / `output/model/test_results.txt`.
-
-## Comandos de Automação & Monitoramento
-
-Os scripts de automação podem ser utilizados contra a AWS ou LocalStack (forneça `--endpoint-url` para apontar para o LocalStack).
-
-```bash
-# Criar um Glue job (exemplo)
-python scripts/glue_automation.py --create-job --job-name glue-etl-job --script-location s3://my-bucket/scripts/glue_job.py
-
-# Criar um gatilho agendado (scheduled trigger)
-python scripts/glue_automation.py --create-trigger --trigger-name daily-trigger --job-name glue-etl-job --cron 'cron(0 2 * * ? *)'
-
-# Iniciar a execução de um job imediatamente
-python scripts/glue_automation.py --start-job --job-name glue-etl-job
-
-# Monitorar execuções de jobs
-python scripts/monitor_glue_jobs.py --job-name glue-etl-job --interval 30
-
-```
-
-## Comando para Gráfico Comparativo
-
-```bash
-python scripts/comparative_series.py --symbol PETR4T --input-dir files/training-set --output-dir output/plots
-
-```
-
-## Refatoração Ticker/CSV -> Spark -> LocalStack (Correção de `st.form` do Streamlit)
-
-### Problema
-
-O aplicativo Streamlit ocasionalmente apresentava o erro: `There are multiple identical forms with key='data_input'.`
-Isso acontecia porque o PySpark (treino/ETL) executava de forma síncrona **dentro** do processo do Streamlit.
-A JVM do Spark bloqueia o interpretador Python por longos períodos e o `build_spark_session()` aponta o `HADOOP_HOME` para o próprio diretório de trabalho do projeto, fazendo com que os arquivos temporários da JVM sob essa árvore fossem detectados pelo observador de arquivos (file-watcher) do Streamlit, disparando execuções simultâneas que colidiam na chave do widget `st.form`.
-
-### Solução: isolamento por subprocesso
-
-Todo o trabalho do PySpark agora roda em subprocessos independentes invocados a partir de `app/app.py` via `subprocess.run([sys.executable, "-m", ...])`; o próprio processo do Streamlit nunca importa o PySpark ou inicia uma JVM. Cada subprocesso imprime uma linha final em formato JSON contendo o resumo na saída padrão (stdout), a qual o `app.py` analisa para localizar os arquivos de saída e métricas para renderização.
-
-* `python -m app.glue_job --mode price-series --input <raw.csv> --source-name <slug>` (ETL do PySpark)
-* `python -m scripts.spark_predictive_model --mode forecast --forecast-input <treated.csv> --source-name <slug>` (PySpark MLlib)
-
-### `pandas_datareader.data.get_data_yahoo`
-
-Conforme solicitado, o histórico do ticker é buscado com `pandas_datareader.data.get_data_yahoo` em vez da chamada anterior `DataReader(ticker, "stooq", ...)` (que já estava quebrada na origem).
-
-* O `pandas-datareader` 0.11.1 (última versão disponível até o momento) removeu completamente o `get_data_yahoo` e a fonte `"stooq"`, portanto o código anterior já não funcionava com a versão instalada.
-* O `pandas-datareader==0.10.0` ainda possui o `get_data_yahoo`, mas sua importação quebra nas versões recentes do pandas devido à função `pandas.util._decorators.deprecate_kwarg` ter recebido um argumento obrigatório `klass` no início. O arquivo `scripts/data_processing.py::_ensure_pandas_datareader_compat()` realiza o *shim* (correção de compatibilidade detectada em tempo de execução, sem efeito nas versões do pandas que não necessitam dela) antes de importar `pandas_datareader.data`.
-* O endpoint de raspagem de HTML do Yahoo Finance utilizado internamente pelo `get_data_yahoo` foi descontinuado e atualmente retorna erro 404 para chamadas de rede reais — uma limitação **externa** conhecida e sem correção, não sendo um bug nesta base de código. As falhas são tratadas como `DataProcessingError` com uma mensagem clara; os testes simulam (mock) a chamada de forma que permaneçam determinísticos, independentemente da disponibilidade do Yahoo. O envio de arquivo CSV continua sendo uma alternativa totalmente funcional caso o Yahoo esteja inacessível.
-* Os dados brutos buscados (ou enviados) são sempre salvos em `files/from-input/{ticker-or-slug}.csv`, que se torna a entrada para a etapa de ETL do PySpark.
-
-### `app/glue_pipeline.py::transform_price_series`
-
-Uma nova transformação PySpark-SQL normaliza qualquer CSV bruto de preço (download de ticker ou upload) para apenas `date`/`close`, replicando as regras de negócio que antes ficavam no pandas (`scripts/data_processing.py::finalize_price_dataframe`): detecta colunas de data/fechamento/símbolo sem distinção de maiúsculas/minúsculas, descarta o 7º ticker distinto emitindo um aviso caso múltiplos símbolos estejam presentes, analisa datas no formato ISO/dd-MM-aaaa/compacto-`aaaaMM` e preços com vírgula decimal via `try_to_date`/`try_cast` (necessário pois o modo ANSI do Spark 4.x lança exceção em vez de retornar nulo em `to_date`), remove duplicatas por data mantendo a última ocorrência e limita a série temporal aos últimos 365 dias. Coberto por `tests/test_glue_pipeline.py`.
-
-### `app/glue_job.py --mode price-series`
-
-O novo modo de CLI encapsula o `transform_price_series`: lê o CSV bruto (separador auto-detectado), grava o CSV tratado `date;close` em `files/from-file/{slug}.csv`, grava uma cópia em Parquet em `output/processed_stock_data/{slug}.parquet` e faz o upload do arquivo Parquet para um bucket S3 do LocalStack (criado automaticamente caso não exista). Imprime uma linha de resumo em JSON para os chamadores de subprocesso. O comportamento legado `--mode stock` (OHLCV multi-símbolo) foi preservado sem alterações.
-
-### Fusão de `scripts/ml_model.py` em `scripts/spark_predictive_model.py`
-
-O arquivo `scripts/ml_model.py` foi mesclado ao `scripts/spark_predictive_model.py` e removido. O arquivo unificado agora expõe ambos os fluxos:
-
-* `--mode forecast --forecast-input <csv>`: o modelo de previsão de data/fechamento de símbolo único (antigo conteúdo do `ml_model.py`: `ForecastResult`, `ModelTrainingError`, `train_predict_evaluate`, busca de hiperparâmetros por faixa de R2, persistência de artefatos). A persistência foi estendida de modo que o `future_predictions.csv` agora também é gravado em `output/model-test/` (anteriormente apenas as `past_predictions`/métricas eram salvas) — necessário pois o `app.py` realiza a leitura de volta do disco após a finalização do subprocesso, sem a existência de um objeto `ForecastResult` em memória compartilhado entre os limites do processo.
-* `--mode training --training-dir ... --test-file ...`: o fluxo original de comparação multi-símbolo do COTAHIST (LinearRegression/RandomForest/GBT), sem alterações.
-
-### `scripts/localstack_pipeline_test.py`
-
-Reescrito para testar o novo fluxo de séries de preços de ponta a ponta contra um container do LocalStack ativo: garante a presença dos recursos do LocalStack, auto-detecta um CSV em `files/from-input/` (ou sintetiza uma amostra determinística para que o teste nunca dependa de acesso à rede), executa o `app.glue_job --mode price-series`, verifica se o objeto Parquet resultante existe no S3 via `boto3`, executa o `scripts.spark_predictive_model --mode forecast` contra o CSV tratado e verifica se todos os artefatos de previsão existem em disco. Grava um relatório em `output/localstack_test_results.txt`.
-
-### Limpeza do Repositório
-
-* Removido `scripts/ml_model.py` (mesclado em `scripts/spark_predictive_model.py`).
-* Removido do rastreamento do git o estado de execução do LocalStack que havia sido commitado acidentalmente (`docker/volume/**` — certificados, licença, ID da máquina), binários Parquet desatualizados (`output/processed_stock_data/*.parquet`) e bytecode compilado (`scripts/__pycache__/*.pyc`); adicionados `docker/volume/`, `output/`, `*.parquet`, `*.pyc` ao `.gitignore`.
-* Extraídos utilitários compartilhados de CSV (`detect_csv_separator*`, `slugify`) que estavam duplicados em `scripts/data_processing.py`, `scripts/comparative_series.py` e `scripts/spark_predictive_model.py` para um novo módulo `scripts/csv_utils.py`.
+- O histórico do ticker é buscado com yfinance.download.
+- O fluxo de previsão persiste artefatos de treino, previsões de teste e previsões futuras em output/analysis/ e output/model-test/.
+- O cache de forecast incrementa um contador de processamento sempre que um ticker é analisado.
+- O limite máximo de reprocessamentos por ticker é 7: ao atingir o limite com histórico válido, o pipeline reutiliza o cache mais recente daquele ticker.
+- O ponto de partida da projeção futura é sempre a data mais recente presente no intervalo de dados fornecido.
+- O módulo scripts/csv_utils.py concentra utilidades compartilhadas para detecção de separador e geração de slug.
+- O arquivo docker/docker-compose.yml usa a imagem comunitária `localstack/localstack:3.5.0`.

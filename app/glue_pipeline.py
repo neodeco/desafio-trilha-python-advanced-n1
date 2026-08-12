@@ -123,37 +123,22 @@ def transform_price_series(
         ]
 
         if len(ordered_symbols) > 1:
-            if len(ordered_symbols) < seventh_ticker_position:
-                warnings.append(
-                    f"Foram encontrados {len(ordered_symbols)} tickers diferentes no arquivo. "
-                    "Nenhum ticker foi removido pois nao ha um setimo ticker distinto."
-                )
-            else:
-                seventh_ticker = ordered_symbols[seventh_ticker_position - 1]
-                removed_rows = df.filter(F.col(symbol_column) == F.lit(seventh_ticker)).count()
-                df = df.filter(
-                    F.col(symbol_column).isNull() | (F.col(symbol_column) != F.lit(seventh_ticker))
-                )
-                warnings.append(
-                    f"Foram encontrados {len(ordered_symbols)} tickers diferentes no arquivo. "
-                    f"O setimo ticker ('{seventh_ticker}') foi filtrado e {removed_rows} linha(s) removida(s)."
-                )
+            raise ValueError(
+                f"O arquivo contem {len(ordered_symbols)} tickers diferentes. "
+                "O arquivo deve conter apenas uma unica acao (ticker)."
+            )
 
     raw_date_text = F.trim(F.col(date_column).cast(StringType()))
-    compact_month = raw_date_text.rlike(r"^\d{6}$")
-    normalized_date_text = F.when(compact_month, F.concat(raw_date_text, F.lit("01"))).otherwise(raw_date_text)
+    # Dates must contain year, month **and** day. 6-digit YYYYMM-only strings
+    # are intentionally not padded and will produce NULL (row dropped).
 
-    # `try_to_date` (instead of `to_date`) returns NULL on unparsable input
-    # rather than raising, which is required for the coalesce-based fallback
-    # to work under Spark's ANSI mode. Try ISO first (unambiguous), then fall
-    # back to day-first formats, matching the previous pandas
-    # `dayfirst=True` convention for non-ISO input.
-    parsed_date = F.coalesce(
-        F.try_to_date(normalized_date_text, "yyyy-MM-dd"),
-        F.try_to_date(normalized_date_text, "yyyyMMdd"),
-        F.try_to_date(normalized_date_text, "dd/MM/yyyy"),
-        F.try_to_date(normalized_date_text, "MM/dd/yyyy"),
-        F.try_to_date(normalized_date_text, "yyyy/MM/dd"),
+    # Guard each format with regex so invalid rows become NULL without relying
+    # on Spark-version-specific `try_*` helpers.
+    parsed_date = (
+        F.when(raw_date_text.rlike(r"^\d{4}-\d{2}-\d{2}$"), F.to_date(raw_date_text, "yyyy-MM-dd"))
+        .when(raw_date_text.rlike(r"^\d{8}$"), F.to_date(raw_date_text, "yyyyMMdd"))
+        .when(raw_date_text.rlike(r"^\d{2}/\d{2}/\d{4}$"), F.to_date(raw_date_text, "dd/MM/yyyy"))
+        .when(raw_date_text.rlike(r"^\d{4}/\d{2}/\d{2}$"), F.to_date(raw_date_text, "yyyy/MM/dd"))
     )
 
     raw_close_text = F.trim(F.col(close_column).cast(StringType()))
@@ -162,7 +147,10 @@ def transform_price_series(
         has_comma_decimal,
         F.regexp_replace(F.regexp_replace(raw_close_text, r"\.", ""), ",", "."),
     ).otherwise(raw_close_text)
-    parsed_close = cleaned_close_text.try_cast(DoubleType())
+    parsed_close = F.when(
+        cleaned_close_text.rlike(r"^[+-]?\d+(\.\d+)?$"),
+        cleaned_close_text.cast(DoubleType()),
+    ).otherwise(F.lit(None).cast(DoubleType()))
 
     normalized = (
         df.withColumn("date", parsed_date)

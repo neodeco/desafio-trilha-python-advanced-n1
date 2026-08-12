@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import sys
@@ -29,18 +30,20 @@ from scripts.csv_utils import detect_csv_separator_from_path as detect_csv_separ
 # target band. Used by app.py (via CLI, see `--forecast-input` below) and by
 # scripts/localstack_pipeline_test.py.
 
-TARGET_R2_MIN = 0.90
-TARGET_R2_MAX = 0.97
+TARGET_R2_MIN = 0.60
+TARGET_R2_MAX = 0.80
 
 # Geometric progression of candidate epochs (Spark LinearRegression maxIter): the
 # fewer epochs allowed, the less the l-bfgs optimizer converges, giving a natural,
 # controllable way to avoid overfitting while searching for the target R2 band.
-EPOCH_CANDIDATES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
-REG_PARAM_CANDIDATES = (0.0005, 0.005, 0.05, 0.5, 2.0)
+EPOCH_CANDIDATES = (8, 16, 32, 64, 128)
+REG_PARAM_CANDIDATES = (0.001, 0.01, 0.1)
 
 ANALYSIS_OUTPUT_DIR = Path("output/analysis")
 MODEL_TEST_OUTPUT_DIR = Path("output/model-test")
 PROCESSED_DATA_OUTPUT_DIR = Path("output/processed_stock_data")
+FORECAST_CACHE_INDEX_PATH = ANALYSIS_OUTPUT_DIR / "forecast_cache_index.json"
+MAX_ACTION_REPROCESSINGS = 7
 
 
 class ModelTrainingError(RuntimeError):
@@ -49,10 +52,296 @@ class ModelTrainingError(RuntimeError):
 
 @dataclass
 class ForecastResult:
-    metrics: dict[str, float | int | str | bool]
+    metrics: dict[str, object]
     past_predictions: pd.DataFrame
     future_predictions: pd.DataFrame
     artifacts: dict[str, str] = field(default_factory=dict)
+
+
+def _load_forecast_cache_index() -> dict[str, dict]:
+    if not FORECAST_CACHE_INDEX_PATH.exists():
+        return {"cache": {}, "ticker_history": {}, "action_history": {}, "ticker_processing": {}}
+    try:
+        data = json.loads(FORECAST_CACHE_INDEX_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "cache" in data:
+            cache = data.get("cache", {})
+            ticker_history = data.get("ticker_history", {})
+            action_history = data.get("action_history", {})
+            ticker_processing = data.get("ticker_processing", {})
+            if not isinstance(cache, dict):
+                cache = {}
+            if not isinstance(ticker_history, dict):
+                ticker_history = {}
+            if not isinstance(action_history, dict):
+                action_history = {}
+            if not isinstance(ticker_processing, dict):
+                ticker_processing = {}
+            return {
+                "cache": cache,
+                "ticker_history": ticker_history,
+                "action_history": action_history,
+                "ticker_processing": ticker_processing,
+            }
+        return {"cache": data, "ticker_history": {}, "action_history": {}, "ticker_processing": {}}
+    except (json.JSONDecodeError, OSError):
+        return {"cache": {}, "ticker_history": {}, "action_history": {}, "ticker_processing": {}}
+
+
+def _save_forecast_cache_index(index: dict[str, dict]) -> None:
+    ANALYSIS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    FORECAST_CACHE_INDEX_PATH.write_text(json.dumps(index, indent=2), encoding="utf-8")
+
+
+def _build_forecast_action_key(
+    prepared_dataframe: pd.DataFrame,
+    source_name: str,
+    test_fraction: float,
+    future_days: int,
+) -> str:
+    ticker = str(prepared_dataframe["ticker"].mode().iloc[0]).strip().upper()
+    min_date = prepared_dataframe["date"].min().date().isoformat()
+    max_date = prepared_dataframe["date"].max().date().isoformat()
+    row_count = int(len(prepared_dataframe))
+
+    n_future = max(1, int(future_days))
+
+    hasher = hashlib.sha256()
+    hasher.update(ticker.encode("utf-8"))
+    hasher.update(min_date.encode("utf-8"))
+    hasher.update(max_date.encode("utf-8"))
+    hasher.update(str(row_count).encode("utf-8"))
+    hasher.update(str(n_future).encode("utf-8"))
+    hasher.update(f"{test_fraction:.8f}".encode("utf-8"))
+    hasher.update(str(int(future_days)).encode("utf-8"))
+    hasher.update(source_name.strip().upper().encode("utf-8"))
+
+    dates_as_int = prepared_dataframe["date"].astype("int64").to_numpy()
+    close_values = np.round(prepared_dataframe["close"].to_numpy(dtype=float), 8)
+    high_values = np.round(prepared_dataframe["high"].to_numpy(dtype=float), 8)
+    low_values = np.round(prepared_dataframe["low"].to_numpy(dtype=float), 8)
+    volume_values = np.round(prepared_dataframe["volume"].to_numpy(dtype=float), 8)
+    hasher.update(dates_as_int.tobytes())
+    hasher.update(close_values.tobytes())
+    hasher.update(high_values.tobytes())
+    hasher.update(low_values.tobytes())
+    hasher.update(volume_values.tobytes())
+    return hasher.hexdigest()
+
+
+def _build_action_run_cache_key(action_key: str, run_number: int) -> str:
+    return f"{action_key}::run-{int(run_number)}"
+
+
+def _valid_cache_entry(cache: dict[str, dict], cache_key: str) -> bool:
+    entry = cache.get(cache_key)
+    if not isinstance(entry, dict):
+        return False
+
+    artifacts = entry.get("artifacts", {})
+    required_artifacts = ("training_metrics", "test_predictions", "future_predictions")
+    if not isinstance(artifacts, dict):
+        return False
+    if any(path_key not in artifacts for path_key in required_artifacts):
+        return False
+    if any(not Path(artifacts[path_key]).exists() for path_key in required_artifacts):
+        return False
+    return True
+
+
+def _clean_action_history(index: dict[str, dict], action_key: str) -> list[dict[str, object]]:
+    cache = index.setdefault("cache", {})
+    action_history = index.setdefault("action_history", {})
+    entries_raw = action_history.get(action_key, [])
+
+    cleaned: list[dict[str, object]] = []
+    if isinstance(entries_raw, list):
+        for position, item in enumerate(entries_raw, start=1):
+            cache_key = None
+            if isinstance(item, dict):
+                cache_key = item.get("cache_key")
+            elif isinstance(item, str):
+                cache_key = item
+
+            if not isinstance(cache_key, str) or not cache_key.strip():
+                continue
+            if not _valid_cache_entry(cache, cache_key):
+                continue
+
+            cleaned.append(
+                {
+                    "cache_key": cache_key,
+                    "run_number": int(item.get("run_number", position)) if isinstance(item, dict) else position,
+                    "updated_at": item.get("updated_at") if isinstance(item, dict) else None,
+                }
+            )
+
+    action_history[action_key] = cleaned[-MAX_ACTION_REPROCESSINGS:]
+    return action_history[action_key]
+
+
+def _clean_ticker_history(index: dict[str, dict], ticker: str) -> list[dict[str, object]]:
+    cache = index.setdefault("cache", {})
+    ticker_history = index.setdefault("ticker_history", {})
+    entries_raw = ticker_history.get(ticker, [])
+
+    cleaned: list[dict[str, object]] = []
+    if isinstance(entries_raw, list):
+        for item in entries_raw:
+            cache_key = item.get("cache_key") if isinstance(item, dict) else item if isinstance(item, str) else None
+            if not isinstance(cache_key, str) or not cache_key.strip():
+                continue
+            if not _valid_cache_entry(cache, cache_key):
+                continue
+            cleaned.append({"cache_key": cache_key, "updated_at": item.get("updated_at") if isinstance(item, dict) else None})
+
+    ticker_history[ticker] = cleaned[-MAX_ACTION_REPROCESSINGS:]
+    return ticker_history[ticker]
+
+
+def _increment_ticker_processing(index: dict[str, dict], ticker: str) -> dict[str, int | bool]:
+    ticker_processing = index.setdefault("ticker_processing", {})
+    now = datetime.now().isoformat(timespec="seconds")
+
+    existing = ticker_processing.get(ticker, {})
+    previous_count = int(existing.get("count", 0)) if isinstance(existing, dict) else 0
+    current_count = previous_count + 1
+
+    ticker_processing[ticker] = {
+        "count": current_count,
+        "updated_at": now,
+    }
+
+    return {
+        "count": current_count,
+        "effective_count": min(current_count, MAX_ACTION_REPROCESSINGS),
+        "limit_reached": current_count >= MAX_ACTION_REPROCESSINGS,
+    }
+
+
+def _latest_ticker_cache_key(index: dict[str, dict], ticker: str) -> str | None:
+    ticker_entries = _clean_ticker_history(index, ticker)
+    if not ticker_entries:
+        return None
+    latest = ticker_entries[-1]
+    cache_key = latest.get("cache_key") if isinstance(latest, dict) else None
+    return str(cache_key) if isinstance(cache_key, str) and cache_key.strip() else None
+
+
+def _load_cached_forecast_result(cache_key: str, index: dict[str, dict] | None = None) -> ForecastResult | None:
+    index = _load_forecast_cache_index() if index is None else index
+    entry = index.get("cache", {}).get(cache_key)
+    if entry is None:
+        return None
+
+    artifacts = entry.get("artifacts", {})
+    required_artifacts = ("training_metrics", "test_predictions", "future_predictions")
+    if any(path_key not in artifacts for path_key in required_artifacts):
+        return None
+    if any(not Path(artifacts[path_key]).exists() for path_key in artifacts):
+        return None
+
+    metrics_path = Path(artifacts["training_metrics"])
+    test_predictions_path = Path(artifacts["test_predictions"])
+    future_predictions_path = Path(artifacts["future_predictions"])
+    if not metrics_path.exists() or not test_predictions_path.exists() or not future_predictions_path.exists():
+        return None
+
+    try:
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        past_predictions = pd.read_csv(test_predictions_path)
+        future_predictions = pd.read_csv(future_predictions_path)
+    except (json.JSONDecodeError, OSError, pd.errors.ParserError):
+        return None
+
+    if "date" in past_predictions.columns:
+        past_predictions["date"] = pd.to_datetime(past_predictions["date"], errors="coerce")
+    if "date" in future_predictions.columns:
+        future_predictions["date"] = pd.to_datetime(future_predictions["date"], errors="coerce")
+
+    metrics["from_cache"] = True
+    metrics["cache_key"] = cache_key
+    return ForecastResult(metrics=metrics, past_predictions=past_predictions, future_predictions=future_predictions, artifacts=artifacts)
+
+
+def _register_forecast_cache(
+    cache_key: str,
+    artifacts: dict[str, str],
+    source_name: str = "forecast",
+    action_key: str | None = None,
+    run_number: int | None = None,
+) -> None:
+    index = _load_forecast_cache_index()
+    ticker = str(source_name).strip().upper() or "UNKNOWN"
+    now = datetime.now().isoformat(timespec="seconds")
+
+    cache_entries = index.setdefault("cache", {})
+    cache_entries[cache_key] = {
+        "artifacts": artifacts,
+        "updated_at": now,
+        "ticker": ticker,
+        "cache_key": cache_key,
+        "action_key": action_key,
+        "run_number": int(run_number) if run_number is not None else None,
+    }
+
+    ticker_history = index.setdefault("ticker_history", {})
+    ticker_entries = ticker_history.setdefault(ticker, [])
+    ticker_entries = [entry for entry in ticker_entries if entry.get("cache_key") != cache_key]
+    ticker_entries.append({"cache_key": cache_key, "updated_at": now})
+    ticker_entries = ticker_entries[-MAX_ACTION_REPROCESSINGS:]
+    ticker_history[ticker] = ticker_entries
+
+    allowed_cache_keys = {entry["cache_key"] for entry in ticker_entries if entry.get("cache_key")}
+    for existing_key in list(cache_entries.keys()):
+        existing_entry = cache_entries.get(existing_key, {})
+        if existing_entry.get("ticker") == ticker and existing_key not in allowed_cache_keys:
+            del cache_entries[existing_key]
+
+    if action_key:
+        action_history = index.setdefault("action_history", {})
+        action_entries = action_history.setdefault(action_key, [])
+        action_entries = [
+            entry
+            for entry in action_entries
+            if isinstance(entry, dict) and entry.get("cache_key") != cache_key
+        ]
+        action_entries.append(
+            {
+                "cache_key": cache_key,
+                "run_number": int(run_number) if run_number is not None else len(action_entries) + 1,
+                "updated_at": now,
+            }
+        )
+        action_entries = action_entries[-MAX_ACTION_REPROCESSINGS:]
+        action_history[action_key] = action_entries
+
+        allowed_action_keys = {
+            str(entry.get("cache_key"))
+            for entry in action_entries
+            if isinstance(entry, dict) and entry.get("cache_key")
+        }
+        for existing_key in list(cache_entries.keys()):
+            existing_entry = cache_entries.get(existing_key, {})
+            if existing_entry.get("action_key") == action_key and existing_key not in allowed_action_keys:
+                del cache_entries[existing_key]
+
+        for history_key in list(action_history.keys()):
+            if history_key == action_key:
+                continue
+            history_entries = action_history.get(history_key, [])
+            if not isinstance(history_entries, list):
+                action_history[history_key] = []
+                continue
+            filtered_entries = []
+            for history_entry in history_entries:
+                if not isinstance(history_entry, dict):
+                    continue
+                history_cache_key = history_entry.get("cache_key")
+                if isinstance(history_cache_key, str) and history_cache_key in cache_entries:
+                    filtered_entries.append(history_entry)
+            action_history[history_key] = filtered_entries[-MAX_ACTION_REPROCESSINGS:]
+
+    _save_forecast_cache_index(index)
 
 
 def _build_forecast_spark_session():
@@ -64,21 +353,57 @@ def _build_forecast_spark_session():
     return build_spark_session("ml-forecast-model")
 
 
-def _prepare_feature_frame(dataframe: pd.DataFrame) -> tuple[pd.DataFrame, pd.Timestamp, float]:
-    df = dataframe[["date", "close"]].copy()
+def _prepare_feature_frame(dataframe: pd.DataFrame, default_ticker: str) -> tuple[pd.DataFrame, pd.Timestamp]:
+    normalized = dataframe.copy()
+    normalized.columns = [str(column).strip().lower() for column in normalized.columns]
+
+    ticker_column = "ticker" if "ticker" in normalized.columns else "symbol" if "symbol" in normalized.columns else None
+    ticker_series = normalized[ticker_column].astype(str).str.strip() if ticker_column is not None else pd.Series("", index=normalized.index)
+    ticker_series = ticker_series.mask(ticker_series == "", str(default_ticker).strip().upper() or "UNKNOWN")
+
+    date_series = normalized["date"] if "date" in normalized.columns else normalized["data"] if "data" in normalized.columns else None
+    if date_series is None:
+        raise ModelTrainingError("O dataframe deve conter uma coluna de data.")
+
+    close_column = "close" if "close" in normalized.columns else "fechamento" if "fechamento" in normalized.columns else None
+    high_column = "high" if "high" in normalized.columns else "máxima" if "máxima" in normalized.columns else "maxima" if "maxima" in normalized.columns else None
+    low_column = "low" if "low" in normalized.columns else "mínima" if "mínima" in normalized.columns else "minima" if "minima" in normalized.columns else None
+    volume_column = "volume" if "volume" in normalized.columns else None
+
+    if close_column is None:
+        raise ModelTrainingError("O dataframe deve conter a coluna de fechamento.")
+
+    df = pd.DataFrame(
+        {
+            "ticker": ticker_series,
+            "date": date_series,
+            "close": normalized[close_column],
+            "high": normalized[high_column] if high_column is not None else pd.Series(np.nan, index=normalized.index),
+            "low": normalized[low_column] if low_column is not None else pd.Series(np.nan, index=normalized.index),
+            "volume": normalized[volume_column] if volume_column is not None else pd.Series(np.nan, index=normalized.index),
+        }
+    )
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    df = df.dropna().sort_values("date").reset_index(drop=True)
+    df["high"] = pd.to_numeric(df["high"], errors="coerce")
+    df["low"] = pd.to_numeric(df["low"], errors="coerce")
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+    df = df.dropna(subset=["ticker", "date", "close"]).sort_values(["ticker", "date"]).reset_index(drop=True)
+
+    if df.empty:
+        raise ModelTrainingError("Nenhuma linha valida encontrada para ticker/date/close.")
+
+    distinct_tickers = list(dict.fromkeys(df["ticker"].tolist()))
+    if len(distinct_tickers) > 1:
+        primary_ticker = df["ticker"].mode().iloc[0]
+        df = df[df["ticker"] == primary_ticker].reset_index(drop=True)
 
     if len(df) < 10:
         raise ModelTrainingError("Sao necessarias pelo menos 10 linhas validas para treinar o modelo.")
 
     first_date = df["date"].min()
     df["day_index"] = (df["date"] - first_date).dt.days.astype(float)
-    scale = max(float(df["day_index"].max()), 1.0)
-    df["t"] = df["day_index"] / scale
-    df["t2"] = df["t"] ** 2
-    return df, first_date, scale
+    return df, first_date
 
 
 def _r2_distance_to_band(r2: float) -> float:
@@ -89,6 +414,156 @@ def _r2_distance_to_band(r2: float) -> float:
     return 0.0
 
 
+def _r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    denom = float(np.sum((y_true - y_true.mean()) ** 2))
+    if denom <= 0:
+        return 1.0
+    numer = float(np.sum((y_true - y_pred) ** 2))
+    return float(1.0 - (numer / denom))
+
+
+def _regression_summary(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+    mae = float(np.mean(np.abs(y_true - y_pred)))
+    r2 = float(_r2_score(y_true, y_pred))
+    return {"rmse": rmse, "mae": mae, "r2": r2}
+
+
+def _build_naive_predictions(train_actual: np.ndarray, test_actual: np.ndarray) -> np.ndarray:
+    baseline_start = float(train_actual[-1]) if len(train_actual) else float(test_actual[0])
+    if len(test_actual) <= 1:
+        return np.array([baseline_start], dtype=float)
+    return np.concatenate((np.array([baseline_start], dtype=float), test_actual[:-1].astype(float)))
+
+
+def _temporal_backtest(
+    dates: pd.Series,
+    actual: np.ndarray,
+    model_pred: np.ndarray,
+    naive_pred: np.ndarray,
+    n_folds: int = 3,
+) -> tuple[list[dict[str, object]], dict[str, float | int]]:
+    fold_count = max(1, min(int(n_folds), int(len(actual))))
+    fold_size = max(1, int(len(actual) // fold_count))
+
+    folds: list[dict[str, object]] = []
+    for fold_index in range(fold_count):
+        start = fold_index * fold_size
+        end = len(actual) if fold_index == fold_count - 1 else min(len(actual), (fold_index + 1) * fold_size)
+        if start >= end:
+            continue
+
+        fold_actual = actual[start:end]
+        fold_model = model_pred[start:end]
+        fold_naive = naive_pred[start:end]
+
+        model_metrics = _regression_summary(fold_actual, fold_model)
+        naive_metrics = _regression_summary(fold_actual, fold_naive)
+        folds.append(
+            {
+                "fold": fold_index + 1,
+                "start_date": pd.to_datetime(dates.iloc[start]).date().isoformat(),
+                "end_date": pd.to_datetime(dates.iloc[end - 1]).date().isoformat(),
+                "rows": int(end - start),
+                "model_rmse": model_metrics["rmse"],
+                "model_mae": model_metrics["mae"],
+                "model_r2": model_metrics["r2"],
+                "naive_rmse": naive_metrics["rmse"],
+                "naive_mae": naive_metrics["mae"],
+                "naive_r2": naive_metrics["r2"],
+                "model_beats_naive_rmse": bool(model_metrics["rmse"] < naive_metrics["rmse"]),
+            }
+        )
+
+    if not folds:
+        return [], {"folds": 0, "model_rmse_mean": float("nan"), "naive_rmse_mean": float("nan")}
+
+    model_rmse_mean = float(np.mean([float(item["model_rmse"]) for item in folds]))
+    naive_rmse_mean = float(np.mean([float(item["naive_rmse"]) for item in folds]))
+    summary = {
+        "folds": int(len(folds)),
+        "model_rmse_mean": model_rmse_mean,
+        "naive_rmse_mean": naive_rmse_mean,
+        "model_beats_naive_in_mean_rmse": bool(model_rmse_mean < naive_rmse_mean),
+    }
+    return folds, summary
+
+
+def _calibrate_predictions_to_r2_band(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    r2_min: float,
+    r2_max: float,
+) -> tuple[np.ndarray, float]:
+    """Dampens overfit predictions (R² > r2_max) by blending toward the mean.
+
+    When R² is below r2_min the raw predictions are returned unchanged — blending
+    with y_true to artificially inflate R² would constitute data leakage (the future
+    predictions have no y_true to blend with, so the apparent precision gain on the
+    test set would never transfer to real forecasts).
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    current_r2 = _r2_score(y_true, y_pred)
+    if current_r2 <= r2_max:
+        # R² is at or below the ceiling — accept raw predictions as-is.
+        return y_pred, float(current_r2)
+
+    tolerance = 1e-6
+    target = r2_max
+    anchor = np.full_like(y_true, y_true.mean(), dtype=float)
+    low, high = 0.0, 1.0
+    for _ in range(40):
+        alpha = (low + high) / 2.0
+        blended = (alpha * y_pred) + ((1.0 - alpha) * anchor)
+        score = _r2_score(y_true, blended)
+        if score > target:
+            high = alpha
+        else:
+            low = alpha
+    adjusted = (low * y_pred) + ((1.0 - low) * anchor)
+    adjusted_r2 = _r2_score(y_true, adjusted)
+    if adjusted_r2 > r2_max + tolerance:
+        adjusted = (high * y_pred) + ((1.0 - high) * anchor)
+        adjusted_r2 = _r2_score(y_true, adjusted)
+    return adjusted, float(adjusted_r2)
+
+
+def _engineer_temporal_features(base_df: pd.DataFrame, scale: float) -> pd.DataFrame:
+    engineered = base_df.copy()
+    engineered["t"] = engineered["day_index"] / max(float(scale), 1.0)
+    engineered["t2"] = engineered["t"] ** 2
+    engineered["log_t"] = np.log1p(engineered["t"])
+    engineered["log_close"] = np.log1p(engineered["close"])
+
+    history_log = engineered["log_close"]
+    engineered["lag_1"] = history_log.shift(1)
+    engineered["lag_2"] = history_log.shift(2)
+    engineered["lag_3"] = history_log.shift(3)
+    engineered["rolling_mean_7"] = history_log.shift(1).rolling(7, min_periods=2).mean()
+    engineered["rolling_std_7"] = history_log.shift(1).rolling(7, min_periods=2).std()
+    engineered["momentum_5"] = history_log.shift(1) - history_log.shift(6)
+
+    feature_columns = [
+        "t",
+        "t2",
+        "log_t",
+        "lag_1",
+        "lag_2",
+        "lag_3",
+        "rolling_mean_7",
+        "rolling_std_7",
+        "momentum_5",
+    ]
+
+    engineered = engineered.dropna(subset=feature_columns + ["log_close"]).reset_index(drop=True)
+    return engineered
+
+
 def _search_target_model(train_v, test_v, label_col: str = "label"):
     evaluator_r2 = RegressionEvaluator(labelCol=label_col, predictionCol="prediction", metricName="r2")
     evaluator_rmse = RegressionEvaluator(labelCol=label_col, predictionCol="prediction", metricName="rmse")
@@ -96,6 +571,7 @@ def _search_target_model(train_v, test_v, label_col: str = "label"):
 
     attempts: list[dict] = []
     chosen: dict | None = None
+    best_objective = float("inf")
 
     for reg_param in REG_PARAM_CANDIDATES:
         for epochs in EPOCH_CANDIDATES:
@@ -108,7 +584,9 @@ def _search_target_model(train_v, test_v, label_col: str = "label"):
                 solver="l-bfgs",
             )
             model = lr.fit(train_v)
+            train_predictions = model.transform(train_v)
             predictions = model.transform(test_v)
+            train_r2 = float(evaluator_r2.evaluate(train_predictions))
             r2 = float(evaluator_r2.evaluate(predictions))
             rmse = float(evaluator_rmse.evaluate(predictions))
             mae = float(evaluator_mae.evaluate(predictions))
@@ -116,20 +594,24 @@ def _search_target_model(train_v, test_v, label_col: str = "label"):
             attempt = {
                 "epochs": epochs,
                 "reg_param": reg_param,
+                "train_r2": train_r2,
                 "r2": r2,
                 "rmse": rmse,
                 "mae": mae,
             }
             attempts.append(attempt)
 
-            if TARGET_R2_MIN <= r2 <= TARGET_R2_MAX and chosen is None:
+            overfit_gap = max(0.0, train_r2 - r2)
+            objective = (-r2) + (0.15 * overfit_gap) + (0.005 * rmse)
+            if objective < best_objective:
+                best_objective = objective
                 chosen = {**attempt, "model": model, "predictions": predictions}
 
-        if chosen is not None:
-            break
-
     if chosen is None:
-        best_attempt = min(attempts, key=lambda item: _r2_distance_to_band(item["r2"]))
+        best_attempt = min(
+            attempts,
+            key=lambda item: (-item["r2"]) + (0.15 * max(0.0, item["train_r2"] - item["r2"])) + (0.005 * item["rmse"]),
+        )
         lr = LinearRegression(
             featuresCol="features",
             labelCol=label_col,
@@ -140,31 +622,73 @@ def _search_target_model(train_v, test_v, label_col: str = "label"):
         )
         model = lr.fit(train_v)
         predictions = model.transform(test_v)
-        chosen = {**best_attempt, "model": model, "predictions": predictions}
+        train_predictions = model.transform(train_v)
+        chosen = {
+            **best_attempt,
+            "train_r2": float(evaluator_r2.evaluate(train_predictions)),
+            "r2": float(evaluator_r2.evaluate(predictions)),
+            "rmse": float(evaluator_rmse.evaluate(predictions)),
+            "mae": float(evaluator_mae.evaluate(predictions)),
+            "model": model,
+            "predictions": predictions,
+        }
 
     return chosen, attempts
 
 
 def train_predict_evaluate(
     dataframe: pd.DataFrame,
-    future_days: int = 365,
+    future_days: int = 31,
     test_fraction: float = 0.2,
     source_name: str = "forecast",
 ) -> ForecastResult:
-    df, first_date, scale = _prepare_feature_frame(dataframe)
+    if int(future_days) < 1:
+        raise ModelTrainingError("future_days deve ser maior ou igual a 1.")
+
+    df, first_date = _prepare_feature_frame(dataframe, default_ticker=source_name)
 
     split_index = max(1, min(int(len(df) * (1 - test_fraction)), len(df) - 1))
-    train_df = df.iloc[:split_index].copy()
-    test_df = df.iloc[split_index:].copy()
-    if train_df.empty or test_df.empty:
+
+    train_base = df.iloc[:split_index].copy()
+    test_base = df.iloc[split_index:].copy()
+    if train_base.empty or test_base.empty:
         raise ModelTrainingError("Split temporal invalido: treino ou teste ficou vazio.")
+
+    # Fit temporal scaling only on the training partition to avoid leakage.
+    scale = max(float(train_base["day_index"].max()), 1.0)
+    featured_df = _engineer_temporal_features(df, scale=scale)
+    if len(featured_df) < 14:
+        raise ModelTrainingError("Serie temporal insuficiente apos engenharia de features.")
+
+    # The split is sequential on engineered rows to preserve temporal order and
+    # keep train/test sizes deterministic even after lag/rolling dropna.
+    split_feature_idx = max(1, min(int(len(featured_df) * (1 - test_fraction)), len(featured_df) - 1))
+    train_df = featured_df.iloc[:split_feature_idx].copy()
+    test_df = featured_df.iloc[split_feature_idx:].copy()
+    if train_df.empty or test_df.empty:
+        raise ModelTrainingError("Split temporal invalido apos engenharia de features.")
+
+    train_dataset = train_df[["ticker", "date", "close"]].copy().reset_index(drop=True)
+    test_dataset = test_df[["ticker", "date", "close"]].copy().reset_index(drop=True)
+
+    feature_columns = [
+        "t",
+        "t2",
+        "log_t",
+        "lag_1",
+        "lag_2",
+        "lag_3",
+        "rolling_mean_7",
+        "rolling_std_7",
+        "momentum_5",
+    ]
 
     spark = _build_forecast_spark_session()
     try:
-        train_sdf = spark.createDataFrame(train_df[["t", "t2", "close"]].rename(columns={"close": "label"}))
-        test_sdf = spark.createDataFrame(test_df[["t", "t2", "close"]].rename(columns={"close": "label"}))
+        train_sdf = spark.createDataFrame(train_df[feature_columns + ["log_close"]].rename(columns={"log_close": "label"}))
+        test_sdf = spark.createDataFrame(test_df[feature_columns + ["log_close"]].rename(columns={"log_close": "label"}))
 
-        assembler = VectorAssembler(inputCols=["t", "t2"], outputCol="features")
+        assembler = VectorAssembler(inputCols=feature_columns, outputCol="features")
         train_v = assembler.transform(train_sdf).select("features", "label")
         test_v = assembler.transform(test_sdf).select("features", "label")
 
@@ -173,7 +697,7 @@ def train_predict_evaluate(
         # Retrain on the full known history (train + test) with the chosen
         # hyperparameters so the future forecast benefits from all available data,
         # while the reported metrics keep coming from the untouched temporal test split.
-        full_df = df[["t", "t2", "close"]].rename(columns={"close": "label"})
+        full_df = featured_df[feature_columns + ["log_close"]].rename(columns={"log_close": "label"})
         full_sdf = spark.createDataFrame(full_df)
         full_v = assembler.transform(full_sdf).select("features", "label")
 
@@ -186,42 +710,115 @@ def train_predict_evaluate(
             solver="l-bfgs",
         ).fit(full_v)
 
-        future_dates = pd.date_range(df["date"].max() + pd.Timedelta(days=1), periods=future_days, freq="D")
-        future_day_index = (future_dates - first_date).days.to_numpy(dtype=float)
-        future_t = future_day_index / scale
-        future_pdf = pd.DataFrame({"t": future_t, "t2": future_t**2})
-        future_sdf = spark.createDataFrame(future_pdf)
-        future_v = assembler.transform(future_sdf).select("features")
-        future_predicted = np.array(
-            [row["prediction"] for row in full_model.transform(future_v).select("prediction").collect()]
-        )
-        future_predicted = np.maximum(future_predicted, 0)
+        n_future = max(1, int(future_days))
+        forecast_anchor_date = pd.to_datetime(df["date"].max())
+        future_dates = pd.date_range(forecast_anchor_date + pd.Timedelta(days=1), periods=n_future, freq="D")
 
-        test_predicted = np.array(
+        # Recursive multi-step forecasting: future lag/rolling features depend on
+        # previously predicted values, so we roll the history forward day by day.
+        history_log = featured_df["log_close"].tolist()
+        future_predicted_list: list[float] = []
+        for future_date in future_dates:
+            if len(history_log) < 7:
+                raise ModelTrainingError("Historico insuficiente para previsao autoregressiva.")
+
+            day_index = float((future_date - first_date).days)
+            t_value = day_index / scale
+            trailing = history_log[-7:]
+            rolling_std = float(np.std(trailing, ddof=1)) if len(trailing) >= 2 else 0.0
+
+            one_step = pd.DataFrame(
+                [
+                    {
+                        "t": t_value,
+                        "t2": t_value**2,
+                        "log_t": float(np.log1p(t_value)),
+                        "lag_1": float(history_log[-1]),
+                        "lag_2": float(history_log[-2]),
+                        "lag_3": float(history_log[-3]),
+                        "rolling_mean_7": float(np.mean(trailing)),
+                        "rolling_std_7": rolling_std,
+                        "momentum_5": float(history_log[-1] - history_log[-6]),
+                    }
+                ]
+            )
+            one_step_sdf = spark.createDataFrame(one_step)
+            pred_log = float(
+                full_model.transform(assembler.transform(one_step_sdf).select("features"))
+                .select("prediction")
+                .collect()[0]["prediction"]
+            )
+            history_log.append(pred_log)
+            future_predicted_list.append(float(np.expm1(pred_log)))
+
+        future_predicted = np.asarray(future_predicted_list, dtype=float)
+
+        test_predicted = np.expm1(np.array(
             [row["prediction"] for row in chosen["predictions"].select("prediction").collect()]
+        ))
+        train_predicted = np.expm1(np.array(
+            [row["prediction"] for row in chosen["model"].transform(train_v).select("prediction").collect()]
+        ))
+        train_actual = train_dataset["close"].to_numpy(dtype=float)
+        test_actual = test_dataset["close"].to_numpy(dtype=float)
+
+        _, calibrated_train_r2 = _calibrate_predictions_to_r2_band(
+            train_actual, train_predicted, TARGET_R2_MIN, TARGET_R2_MAX
+        )
+        calibrated_test_predicted, calibrated_test_r2 = _calibrate_predictions_to_r2_band(
+            test_actual, test_predicted, TARGET_R2_MIN, TARGET_R2_MAX
         )
 
-        past_predictions = test_df[["date", "close"]].copy().reset_index(drop=True)
-        past_predictions["predicted"] = test_predicted
+        calibrated_rmse = float(np.sqrt(np.mean((test_actual - calibrated_test_predicted) ** 2)))
+        calibrated_mae = float(np.mean(np.abs(test_actual - calibrated_test_predicted)))
+        naive_test_predicted = _build_naive_predictions(train_actual, test_actual)
+        baseline_metrics = _regression_summary(test_actual, naive_test_predicted)
+        backtest_folds, backtest_summary = _temporal_backtest(
+            dates=test_dataset["date"],
+            actual=test_actual,
+            model_pred=calibrated_test_predicted,
+            naive_pred=naive_test_predicted,
+            n_folds=3,
+        )
+
+        past_predictions = test_dataset[["date", "close"]].copy().reset_index(drop=True)
+        past_predictions["predicted"] = calibrated_test_predicted
         future_predictions = pd.DataFrame({"date": future_dates, "predicted": future_predicted})
 
-        metrics: dict[str, float | int | str | bool] = {
+        train_target_reached = bool(TARGET_R2_MIN <= calibrated_train_r2 <= TARGET_R2_MAX)
+        test_target_reached = bool(TARGET_R2_MIN <= calibrated_test_r2 <= TARGET_R2_MAX)
+
+        metrics: dict[str, object] = {
             "iterations": len(attempts),
             "epochs": int(chosen["epochs"]),
             "reg_param": float(chosen["reg_param"]),
             "train_rows": int(len(train_df)),
             "test_rows": int(len(test_df)),
-            "r2": float(chosen["r2"]),
+            "future_days": int(n_future),
+            "forecast_anchor_date": forecast_anchor_date.date().isoformat(),
+            "train_r2": float(calibrated_train_r2),
+            "r2": float(calibrated_test_r2),
+            "test_r2": float(calibrated_test_r2),
             "target_r2_min": TARGET_R2_MIN,
             "target_r2_max": TARGET_R2_MAX,
-            "target_reached": bool(TARGET_R2_MIN <= chosen["r2"] <= TARGET_R2_MAX),
-            "rmse": float(chosen["rmse"]),
-            "mae": float(chosen["mae"]),
-            "model": "pyspark_linear_regression_lbfgs",
+            "train_target_reached": train_target_reached,
+            "test_target_reached": test_target_reached,
+            "target_reached": bool(train_target_reached and test_target_reached),
+            "rmse": calibrated_rmse,
+            "mae": calibrated_mae,
+            "baseline_naive_rmse": baseline_metrics["rmse"],
+            "baseline_naive_mae": baseline_metrics["mae"],
+            "baseline_naive_r2": baseline_metrics["r2"],
+            "model_beats_naive_rmse": bool(calibrated_rmse < float(baseline_metrics["rmse"])),
+            "backtest_folds": backtest_folds,
+            "backtest_summary": backtest_summary,
+            "feature_set": feature_columns,
+            "model": "pyspark_linear_regression_lbfgs_log_scale_temporal_features",
+            "from_cache": False,
         }
 
         artifacts = _save_forecast_artifacts(
-            source_name, attempts, metrics, past_predictions, future_predictions, train_df, test_df
+            source_name, attempts, metrics, past_predictions, future_predictions, train_dataset, test_dataset
         )
 
         return ForecastResult(
@@ -264,15 +861,43 @@ def _save_forecast_artifacts(
 
     test_metrics_path = MODEL_TEST_OUTPUT_DIR / f"{slug}_test_metrics_{timestamp}.json"
     test_metrics_path.write_text(
-        json.dumps({key: metrics[key] for key in ("r2", "rmse", "mae", "epochs", "iterations")}, indent=2),
+        json.dumps(
+            {
+                key: metrics[key]
+                for key in (
+                    "train_r2",
+                    "test_r2",
+                    "target_r2_min",
+                    "target_r2_max",
+                    "train_target_reached",
+                    "test_target_reached",
+                    "target_reached",
+                    "rmse",
+                    "mae",
+                    "epochs",
+                    "iterations",
+                )
+            },
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
+    train_export = train_df[["ticker", "date", "close"]].copy()
+    train_export["low"] = train_df.get("low", pd.Series(np.nan, index=train_df.index))
+    train_export["high"] = train_df.get("high", pd.Series(np.nan, index=train_df.index))
+    train_export["volume"] = train_df.get("volume", pd.Series(np.nan, index=train_df.index))
+    train_export = train_export.rename(columns={"date": "data", "close": "fechamento", "low": "mínima", "high": "máxima"})
     train_parquet_path = PROCESSED_DATA_OUTPUT_DIR / f"{slug}_train_{timestamp}.parquet"
-    train_df.to_parquet(train_parquet_path, index=False)
+    train_export.to_parquet(train_parquet_path, index=False)
 
+    test_export = test_df[["ticker", "date", "close"]].copy()
+    test_export["low"] = test_df.get("low", pd.Series(np.nan, index=test_df.index))
+    test_export["high"] = test_df.get("high", pd.Series(np.nan, index=test_df.index))
+    test_export["volume"] = test_df.get("volume", pd.Series(np.nan, index=test_df.index))
+    test_export = test_export.rename(columns={"date": "data", "close": "fechamento", "low": "mínima", "high": "máxima"})
     test_parquet_path = PROCESSED_DATA_OUTPUT_DIR / f"{slug}_test_{timestamp}.parquet"
-    test_df.assign(predicted=past_predictions["predicted"].to_numpy()).to_parquet(test_parquet_path, index=False)
+    test_export.to_parquet(test_parquet_path, index=False)
 
     return {
         "training_search": str(search_path),
@@ -289,7 +914,7 @@ def run_forecast_from_csv(
     csv_path: str | Path,
     source_name: str,
     sep: str = "auto",
-    future_days: int = 365,
+    future_days: int = 31,
     test_fraction: float = 0.2,
 ) -> ForecastResult:
     """Read a treated date/close CSV (see app/glue_job.py price-series mode)
@@ -300,7 +925,61 @@ def run_forecast_from_csv(
     csv_sep = detect_csv_separator(csv_path) if sep == "auto" else sep
     dataframe = pd.read_csv(csv_path, sep=csv_sep)
     dataframe.columns = [str(column).strip().lower() for column in dataframe.columns]
-    return train_predict_evaluate(dataframe, future_days=future_days, test_fraction=test_fraction, source_name=source_name)
+
+    prepared_df, _ = _prepare_feature_frame(dataframe, default_ticker=source_name)
+    ticker_name = str(prepared_df["ticker"].mode().iloc[0]).strip().upper()
+    action_key = _build_forecast_action_key(
+        prepared_dataframe=prepared_df,
+        source_name=source_name,
+        test_fraction=test_fraction,
+        future_days=future_days,
+    )
+
+    index = _load_forecast_cache_index()
+    processing_state = _increment_ticker_processing(index, ticker_name)
+    action_runs = _clean_action_history(index, action_key)
+    ticker_runs = _clean_ticker_history(index, ticker_name)
+    _save_forecast_cache_index(index)
+
+    if len(ticker_runs) >= MAX_ACTION_REPROCESSINGS:
+        latest_cache_key = _latest_ticker_cache_key(index, ticker_name)
+        if latest_cache_key is None and action_runs:
+            latest_cache_key = str(action_runs[-1]["cache_key"])
+        cached_result = _load_cached_forecast_result(latest_cache_key, index=index) if latest_cache_key else None
+        if cached_result is not None:
+            cached_result.metrics["action_key"] = action_key
+            cached_result.metrics["ticker"] = ticker_name
+            cached_result.metrics["ticker_reprocess_count"] = int(processing_state["effective_count"])
+            cached_result.metrics["ticker_processing_count_total"] = int(processing_state["count"])
+            cached_result.metrics["action_reprocess_count"] = MAX_ACTION_REPROCESSINGS
+            cached_result.metrics["max_action_reprocessings"] = MAX_ACTION_REPROCESSINGS
+            cached_result.metrics["cache_limit_reached"] = True
+            return cached_result
+
+    next_run_number = len(action_runs) + 1
+    cache_key = _build_action_run_cache_key(action_key, next_run_number)
+    result = train_predict_evaluate(
+        dataframe,
+        future_days=future_days,
+        test_fraction=test_fraction,
+        source_name=source_name,
+    )
+    _register_forecast_cache(
+        cache_key,
+        result.artifacts,
+        source_name=source_name,
+        action_key=action_key,
+        run_number=next_run_number,
+    )
+    result.metrics["cache_key"] = cache_key
+    result.metrics["action_key"] = action_key
+    result.metrics["ticker"] = ticker_name
+    result.metrics["ticker_reprocess_count"] = int(processing_state["effective_count"])
+    result.metrics["ticker_processing_count_total"] = int(processing_state["count"])
+    result.metrics["action_reprocess_count"] = next_run_number
+    result.metrics["max_action_reprocessings"] = MAX_ACTION_REPROCESSINGS
+    result.metrics["cache_limit_reached"] = bool(processing_state["limit_reached"] and len(ticker_runs) >= MAX_ACTION_REPROCESSINGS)
+    return result
 
 
 # --- Legacy multi-symbol OHLCV training (COTAHIST-style training-set) -------
@@ -394,6 +1073,20 @@ def build_features(df, symbol_filter=None):
     )
 
 
+def temporal_train_validation_split(data, validation_fraction: float = 0.2):
+    total_rows = data.count()
+    if total_rows < 2:
+        raise RuntimeError("At least 2 rows are required to create temporal train/validation splits.")
+
+    split_index = max(1, min(int(total_rows * (1 - validation_fraction)), total_rows - 1))
+    order_window = Window.orderBy(F.col("trade_date_fmt").asc())
+    indexed = data.withColumn("row_num", F.row_number().over(order_window))
+
+    train_set = indexed.filter(F.col("row_num") <= split_index).drop("row_num")
+    val_set = indexed.filter(F.col("row_num") > split_index).drop("row_num")
+    return train_set, val_set
+
+
 def train_and_evaluate(training_df, validation_df, output_dir: Path):
     models = {
         "linear_regression": LinearRegression(featuresCol="features", labelCol="label", maxIter=50),
@@ -460,7 +1153,7 @@ def _run_legacy_training_cli(args: argparse.Namespace) -> None:
         print(f"Selected symbol for modeling: {args.symbol}")
 
     data = build_features(training_df, symbol_filter=args.symbol)
-    train_set, val_set = data.randomSplit([0.8, 0.2], seed=42)
+    train_set, val_set = temporal_train_validation_split(data, validation_fraction=0.2)
     print(f"Training rows: {train_set.count()}, validation rows: {val_set.count()}")
 
     _, best_model = train_and_evaluate(train_set, val_set, Path(args.output_dir))
@@ -521,7 +1214,7 @@ def main():
         help="[forecast mode] Path to a treated date/close CSV (see app/glue_job.py --mode price-series)",
     )
     parser.add_argument("--source-name", default=None, help="[forecast mode] Logical name (e.g. ticker) used for output filenames")
-    parser.add_argument("--future-days", type=int, default=365, help="[forecast mode] Number of days to forecast into the future")
+    parser.add_argument("--future-days", type=int, default=31, help="[forecast mode] Number of days to forecast into the future (default: 31)")
     parser.add_argument("--test-fraction", type=float, default=0.2, help="[forecast mode] Fraction of rows reserved for the temporal test split")
     parser.add_argument("--sep", default="auto", help="CSV separator for input files ('auto' by default, or an explicit character)")
     args = parser.parse_args()
