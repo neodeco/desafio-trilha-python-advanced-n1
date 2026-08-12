@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -89,10 +88,12 @@ def _pick_column(dataframe: pd.DataFrame, candidates: tuple[str, ...], label: st
 
 
 def _normalize_dates(series: pd.Series) -> pd.Series:
-    """Convert a raw date-like series to datetime, robust to ISO and dd/mm/yyyy formats."""
+    """Convert a raw date-like series to datetime, robust to ISO and dd/mm/yyyy formats.
+
+    Dates must include year, month **and** day.  6-digit YYYYMM-only strings are
+    intentionally not padded and will be treated as unparseable (NaT).
+    """
     as_text = series.astype(str).str.strip()
-    compact_month = as_text.str.fullmatch(r"\d{6}", na=False)
-    as_text = as_text.where(~compact_month, as_text + "01")
 
     result = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
 
@@ -109,12 +110,12 @@ def _normalize_dates(series: pd.Series) -> pd.Series:
 
 def _normalize_close(series: pd.Series) -> pd.Series:
     if pd.api.types.is_numeric_dtype(series):
-        return pd.to_numeric(series, errors="coerce")
+        return pd.to_numeric(series, errors="coerce").round(6)
 
     values = series.astype(str).str.strip()
     has_comma_decimal = values.str.contains(",", regex=False, na=False)
     cleaned = values.where(~has_comma_decimal, values.str.replace(".", "", regex=False).str.replace(",", ".", regex=False))
-    return pd.to_numeric(cleaned, errors="coerce")
+    return pd.to_numeric(cleaned, errors="coerce").round(6)
 
 
 def _filter_seventh_ticker(dataframe: pd.DataFrame, warnings: list[str]) -> pd.DataFrame:
@@ -175,41 +176,13 @@ def _save_raw_bytes_to_from_input(content: bytes, name: str) -> Path:
 def _save_raw_dataframe_to_from_input(dataframe: pd.DataFrame, name: str) -> Path:
     """Persist a raw (untreated) price dataframe to ``files/from-input/{ticker}.csv``.
 
-    Used after fetching data via ``pandas_datareader.data.get_data_yahoo`` so the
+    Used after fetching data via ``yfinance.download`` so the
     same PySpark ETL pipeline used for CSV uploads also treats ticker data.
     """
     FROM_INPUT_DIR.mkdir(parents=True, exist_ok=True)
     output_path = FROM_INPUT_DIR / f"{slugify(name)}.csv"
     dataframe.to_csv(output_path, index=False)
     return output_path
-
-
-def _ensure_pandas_datareader_compat() -> None:
-    """Patch ``pandas.util._decorators.deprecate_kwarg`` so that
-    ``pandas_datareader`` (pinned to 0.10.0 for ``get_data_yahoo`` support) can be
-    imported under recent pandas versions.
-
-    Recent pandas releases changed ``deprecate_kwarg``'s signature to require a
-    leading ``klass`` (warning class) argument. ``pandas_datareader`` 0.10.0 still
-    calls it with the old signature, so importing it raises a ``TypeError`` unless
-    we shim the function first. The shim is a no-op on pandas versions that still
-    use the old signature.
-    """
-    import pandas.util._decorators as pd_decorators
-
-    signature = inspect.signature(pd_decorators.deprecate_kwarg)
-    if "klass" not in signature.parameters:
-        return
-    if getattr(pd_decorators.deprecate_kwarg, "_patched_for_pandas_datareader", False):
-        return
-
-    original = pd_decorators.deprecate_kwarg
-
-    def _compat_deprecate_kwarg(old_arg_name, new_arg_name=None, mapping=None, stacklevel=2):
-        return original(FutureWarning, old_arg_name, new_arg_name, mapping, stacklevel)
-
-    _compat_deprecate_kwarg._patched_for_pandas_datareader = True
-    pd_decorators.deprecate_kwarg = _compat_deprecate_kwarg
 
 
 def finalize_price_dataframe(raw_df: pd.DataFrame, warnings: list[str] | None = None) -> ProcessingResult:
@@ -256,6 +229,24 @@ def process_csv_input(source: str | Path | bytes | BinaryIO | TextIO, source_nam
 
     dataframe, warnings = _read_csv_auto(content)
 
+    # File uploads must contain exactly one ticker/symbol.
+    symbol_column = _pick_column(dataframe, SYMBOL_COLUMNS, "symbol", required=False)
+    if symbol_column is not None:
+        distinct_tickers = (
+            dataframe[symbol_column]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .pipe(lambda s: s[s != ""])
+            .unique()
+        )
+        if len(distinct_tickers) > 1:
+            raise DataProcessingError(
+                f"O arquivo contem {len(distinct_tickers)} tickers diferentes "
+                f"({', '.join(sorted(distinct_tickers))}). "
+                "O arquivo deve conter apenas uma unica acao (ticker)."
+            )
+
     result = finalize_price_dataframe(dataframe, warnings)
     result.saved_path = _save_to_analysis_folder(result.dataframe, source_name)
     result.raw_csv_path = raw_csv_path
@@ -264,7 +255,7 @@ def process_csv_input(source: str | Path | bytes | BinaryIO | TextIO, source_nam
 
 def fetch_history_by_ticker(ticker: str, start_date: date | datetime, end_date: date | datetime) -> ProcessingResult:
     """Fetch daily price history for ``ticker`` via
-    ``pandas_datareader.data.get_data_yahoo`` and save the raw response to
+    ``yfinance.download`` and save the raw response to
     ``files/from-input/{ticker}.csv``.
 
     The returned :class:`ProcessingResult` also carries a quick pandas-based
@@ -284,22 +275,24 @@ def fetch_history_by_ticker(ticker: str, start_date: date | datetime, end_date: 
     if start > end:
         raise DataProcessingError("A data de inicio deve ser anterior ou igual a data de fim.")
 
-    _ensure_pandas_datareader_compat()
     try:
-        from pandas_datareader import data as web
+        import yfinance as yf
     except ImportError as exc:
         raise DataProcessingError(
-            "pandas_datareader nao esta instalado. Instale a dependencia para buscar historico por ticker."
+            "yfinance nao esta instalado. Instale a dependencia para buscar historico por ticker."
         ) from exc
 
+    # yfinance treats `end` as exclusive for daily bars, so add one day to keep
+    # the user-provided end date effectively inclusive.
+    effective_end = end + pd.Timedelta(days=1)
     try:
-        raw_df = web.get_data_yahoo(ticker, start=start, end=end)
+        raw_df = yf.download(ticker, start=start, end=effective_end, progress=False, auto_adjust=False)
     except (ConnectionError, TimeoutError, OSError) as exc:
         raise DataProcessingError(f"Erro de rede ao buscar historico para {ticker} via Yahoo Finance: {exc}") from exc
     except Exception as exc:
         message = str(exc).strip() or exc.__class__.__name__
         raise DataProcessingError(
-            f"Nao foi possivel buscar o ticker {ticker} via Yahoo Finance (pandas_datareader.get_data_yahoo). "
+            f"Nao foi possivel buscar o ticker {ticker} via Yahoo Finance (yfinance.download). "
             f"Verifique se o simbolo e valido e se o servico esta disponivel: {message}"
         ) from exc
 
@@ -307,6 +300,8 @@ def fetch_history_by_ticker(ticker: str, start_date: date | datetime, end_date: 
         raise DataProcessingError(f"Nenhum dado retornado para o ticker {ticker} no periodo informado.")
 
     raw_df = raw_df.copy()
+    if isinstance(raw_df.columns, pd.MultiIndex):
+        raw_df.columns = raw_df.columns.get_level_values(0)
     raw_df.index.name = raw_df.index.name or "Date"
     raw_df = raw_df.reset_index()
 

@@ -20,6 +20,8 @@ def plot_comparative_forecast(
     future_predictions: pd.DataFrame,
     output_dir: str | Path = "output/plots",
     filename_prefix: str = "forecast",
+    ticker: str | None = None,
+    future_horizon_days: int | None = None,
 ):
     """Static comparative chart: red = actual data, black = 365-day future forecast,
     with the past (test-period) prediction overlaid for comparison."""
@@ -29,6 +31,9 @@ def plot_comparative_forecast(
 
     for dataframe in (actual, past, future):
         dataframe["date"] = pd.to_datetime(dataframe["date"])
+
+    horizon_days = int(future_horizon_days) if future_horizon_days is not None else int(len(future))
+    horizon_days = max(1, horizon_days)
 
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.plot(actual["date"], actual["close"], color="red", linewidth=2, label="Dados reais")
@@ -45,12 +50,13 @@ def plot_comparative_forecast(
         future["predicted"],
         color="black",
         linewidth=2,
-        label="Predicao futura (365 dias)",
+        label=f"Predicao futura ({horizon_days} dias)",
     )
 
     ax.set_xlabel("Ano")
     ax.set_ylabel("Preco")
-    ax.set_title("Comparativo de preco real e predicoes")
+    title_suffix = f" - {ticker}" if ticker else ""
+    ax.set_title(f"Comparativo de preco real e predicoes{title_suffix}")
     ax.legend(loc="best")
     ax.grid(alpha=0.25)
     ax.xaxis.set_major_locator(mdates.YearLocator())
@@ -72,6 +78,8 @@ def build_interactive_forecast_figure(
     future_predictions: pd.DataFrame,
     output_dir: str | Path = "output/plots",
     filename_prefix: str = "forecast",
+    ticker: str | None = None,
+    future_horizon_days: int | None = None,
 ) -> tuple[go.Figure, Path]:
     """Interactive Plotly chart for economists to zoom/hover the final prediction:
     red = actual data, black = 365-day future forecast, dashed = past prediction."""
@@ -81,6 +89,9 @@ def build_interactive_forecast_figure(
 
     for dataframe in (actual, past, future):
         dataframe["date"] = pd.to_datetime(dataframe["date"])
+
+    horizon_days = int(future_horizon_days) if future_horizon_days is not None else int(len(future))
+    horizon_days = max(1, horizon_days)
 
     figure = go.Figure()
     figure.add_trace(
@@ -106,16 +117,22 @@ def build_interactive_forecast_figure(
             x=future["date"],
             y=future["predicted"],
             mode="lines",
-            name="Predicao futura (365 dias)",
+            name=f"Predicao futura ({horizon_days} dias)",
             line={"color": "black", "width": 2},
         )
     )
 
+    title_suffix = f" - {ticker}" if ticker else ""
     figure.update_layout(
-        title="Predicao final de precos (analise interativa)",
-        xaxis_title="Ano",
+        title=f"Predicao final de precos (analise interativa){title_suffix}",
+        xaxis_title="Data (marcacao de 15 em 15 dias)",
         yaxis_title="Preco",
-        xaxis={"tickformat": "%Y", "rangeslider": {"visible": True}},
+        xaxis={
+            "tickformat": "%d/%m<br>%b/%Y",
+            "dtick": 15 * 24 * 60 * 60 * 1000,
+            "tickangle": -30,
+            "rangeslider": {"visible": True},
+        },
         hovermode="x unified",
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02},
         template="plotly_white",

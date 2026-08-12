@@ -66,7 +66,6 @@ def load_csv_data(content: bytes, source_name: str):
     return process_csv_input(content, source_name=source_name)
 
 
-@st.cache_data(show_spinner=False, ttl="15m", max_entries=20)
 def run_price_series_etl(raw_csv_path: str, source_name: str) -> dict:
     """Treat a raw CSV via PySpark (app/glue_job.py), producing a date/close CSV
     in files/from-file/, a Parquet copy, and an upload to S3 via LocalStack."""
@@ -85,7 +84,6 @@ def run_price_series_etl(raw_csv_path: str, source_name: str) -> dict:
     )
 
 
-@st.cache_data(show_spinner=False, ttl="15m", max_entries=20)
 def run_forecast_model(treated_csv_path: str, source_name: str) -> dict:
     """Train/evaluate the PySpark forecast model (scripts/spark_predictive_model.py)
     against a treated date/close CSV."""
@@ -104,32 +102,53 @@ def run_forecast_model(treated_csv_path: str, source_name: str) -> dict:
     )
 
 
-def render_metrics(metrics: dict[str, float | int | str | bool]) -> None:
-    cols = st.columns(5)
-    cols[0].metric("R2 (variancia)", f"{float(metrics['r2']):.4f}")
-    cols[1].metric("RMSE", f"{float(metrics['rmse']):.4f}")
-    cols[2].metric("MAE", f"{float(metrics['mae']):.4f}")
-    cols[3].metric("Iteracoes de busca", f"{int(metrics['iterations'])}")
-    cols[4].metric("Epocas do modelo", f"{int(metrics['epochs'])}")
+def render_metrics(metrics: dict[str, object]) -> None:
+    cols = st.columns(7)
+    cols[0].metric("R2 treino", f"{float(metrics['train_r2']):.4f}")
+    cols[1].metric("R2 teste", f"{float(metrics['test_r2']):.4f}")
+    cols[2].metric("RMSE", f"{float(metrics['rmse']):.4f}")
+    cols[3].metric("MAE", f"{float(metrics['mae']):.4f}")
+    cols[4].metric("Iteracoes de busca", f"{int(metrics['iterations'])}")
+    cols[5].metric("Epocas do modelo", f"{int(metrics['epochs'])}")
+    processing_iteration = int(metrics.get("ticker_reprocess_count", metrics.get("action_reprocess_count", 1)))
+    processing_limit = int(metrics.get("max_action_reprocessings", 7))
+    cols[6].metric("Iteracao processamento", f"{processing_iteration}/{processing_limit}")
 
-    target_status = "atingido" if metrics["target_reached"] else "nao atingido"
+    train_target_status = "atingido" if metrics["train_target_reached"] else "nao atingido"
+    test_target_status = "atingido" if metrics["test_target_reached"] else "nao atingido"
     st.caption(
         f"Modelo: {metrics['model']} | Split temporal (sem shuffle): "
         f"{metrics['train_rows']} treino / {metrics['test_rows']} teste | "
-        f"Faixa de R2 alvo [{metrics['target_r2_min']:.2f} - {metrics['target_r2_max']:.2f}] {target_status}; "
-        f"valor real {float(metrics['r2']):.4f}."
+        f"Faixa de R2 alvo [{metrics['target_r2_min']:.2f} a {metrics['target_r2_max']:.2f}] | "
+        f"treino {train_target_status} ({float(metrics['train_r2']):.4f}) | "
+        f"teste {test_target_status} ({float(metrics['test_r2']):.4f})."
     )
 
+    baseline_rmse = metrics.get("baseline_naive_rmse")
+    backtest_summary = metrics.get("backtest_summary")
+    if baseline_rmse is not None:
+        st.caption(
+            f"Baseline ingenuo (persistencia): RMSE={float(baseline_rmse):.4f} | "
+            f"modelo melhor que baseline por RMSE: {bool(metrics.get('model_beats_naive_rmse', False))}."
+        )
+    if isinstance(backtest_summary, dict):
+        st.caption(
+            "Backtesting temporal (folds sequenciais): "
+            f"folds={int(backtest_summary.get('folds', 0))}, "
+            f"RMSE medio modelo={float(backtest_summary.get('model_rmse_mean', float('nan'))):.4f}, "
+            f"RMSE medio baseline={float(backtest_summary.get('naive_rmse_mean', float('nan'))):.4f}."
+        )
 
-st.title("Previsao de precos com serie temporal")
+
+st.title("Previsao de tendencia de acoes")
 st.caption(
-    "Envie um CSV OU informe ticker + periodo. As duas entradas sao mutuamente exclusivas. "
+    "Envie um CSV OU informe ticker + periodo. As duas entradas sao mutuamente exclusivas. | "
     "O tratamento (PySpark) e o treinamento do modelo rodam em subprocessos separados, "
     "integrados ao LocalStack (S3), para nao bloquear a interface do Streamlit."
 )
 
 with st.form("data_input", border=True):
-    uploaded_csv = st.file_uploader("CSV com colunas date/close (separador ';' ou ',')", type=["csv"])
+    uploaded_csv = st.file_uploader("CSV com colunas date/close (com separador ';')", type=["csv"])
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -188,7 +207,7 @@ st.caption(
 
 # Step 3: PySpark forecast model (subprocess) --------------------------------
 try:
-    with st.spinner("Treinando e avaliando o modelo com PySpark (scripts/spark_predictive_model.py)..."):
+    with st.spinner("Executando treino/predicao com PySpark (scripts/spark_predictive_model.py)..."):
         forecast_summary = run_forecast_model(etl_summary["csv_path"], source_slug)
 except SubprocessJobError as exc:
     st.error(f"Erro inesperado ao treinar o modelo: {exc}")
@@ -212,19 +231,43 @@ interactive_fig, interactive_path = build_interactive_forecast_figure(
     past_predictions=past_predictions,
     future_predictions=future_predictions,
     filename_prefix=source_label,
+    ticker=source_label,
 )
 fig, plot_path = plot_comparative_forecast(
     actual_df=final_df,
     past_predictions=past_predictions,
     future_predictions=future_predictions,
     filename_prefix=source_label,
+    ticker=source_label,
 )
 
 st.subheader("Metricas")
 render_metrics(metrics)
+if bool(metrics.get("from_cache", False)):
+    st.info("Dados de ticker e periodo ja treinados anteriormente. Predicoes reaproveitadas do cache.")
 
-st.subheader("Predicao final (analise interativa para economistas)")
-st.plotly_chart(interactive_fig, use_container_width=True)
+action_identity = "ticker"
+st.caption(
+    f"Identificacao para cache: {action_identity}. "
+    "Cada ticker permite ate 7 processamentos; apos isso, o resultado mais recente e reaproveitado do cache."
+)
+
+max_reprocessings = int(metrics.get("max_action_reprocessings", 7))
+current_reprocessings = int(metrics.get("ticker_reprocess_count", metrics.get("action_reprocess_count", 1)))
+total_processings = int(metrics.get("ticker_processing_count_total", current_reprocessings))
+if bool(metrics.get("cache_limit_reached", False)):
+    st.warning(
+        f"Limite de {max_reprocessings} processamentos para este ticker foi atingido. "
+        "Resultado mais recente reaproveitado do cache."
+    )
+else:
+    st.caption(
+        f"Iteracao de processamento do ticker: {current_reprocessings}/{max_reprocessings} "
+        f"(total historico: {total_processings})."
+    )
+
+st.subheader(f"Predicao final para {source_label} (analise interativa para economistas)")
+st.plotly_chart(interactive_fig)
 st.caption(f"Grafico interativo salvo em {interactive_path}")
 
 st.subheader("Grafico comparativo")
